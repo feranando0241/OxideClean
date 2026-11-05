@@ -33,6 +33,9 @@ ACTIONS:
                            in projects untouched for DAYS days (default 90), with
                            how to rebuild them (read-only)
       --all                ...in every project, marking the active ones
+      --trash              ...and choose which to move to the Trash
+      --yes, -y            ...move forgotten projects without asking, except those
+                           with programs in target/release (not with --all)
     --similar <FILE>       Documents with content similar to FILE
       --threshold <N>      Minimum similarity percentage (default 30)
 
@@ -73,6 +76,8 @@ pub enum Action {
     Artifacts {
         days: u64,
         all: bool,
+        trash: bool,
+        assume_yes: bool,
     },
     Similar {
         file: String,
@@ -156,6 +161,8 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             "--artifacts" => Some(Action::Artifacts {
                 days: optional_days(&mut iter, "--artifacts", DEFAULT_ARTIFACT_DAYS)?,
                 all: false,
+                trash: false,
+                assume_yes: false,
             }),
             "--all" => {
                 all = true;
@@ -217,14 +224,18 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
 
     // Attach modifiers to their action, rejecting them anywhere else
     let is_dupes = matches!(action, Some(Action::Dupes { .. }));
-    if trash && !is_dupes {
-        return Err("--trash can only be used with --dupes".to_string());
+    let is_artifacts = matches!(action, Some(Action::Artifacts { .. }));
+    if trash && !is_dupes && !is_artifacts {
+        return Err("--trash can only be used with --dupes or --artifacts".to_string());
     }
     if keep_in.is_some() && !is_dupes {
         return Err("--keep-in can only be used with --dupes".to_string());
     }
     if assume_yes && !trash {
-        return Err("--yes can only be used with --dupes --trash".to_string());
+        return Err("--yes can only be used with --trash".to_string());
+    }
+    if all && assume_yes {
+        return Err("--yes can't be used with --all: active projects must be chosen".to_string());
     }
     if all && !matches!(action, Some(Action::Artifacts { .. })) {
         return Err("--all can only be used with --artifacts".to_string());
@@ -242,7 +253,12 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             file,
             threshold: threshold.unwrap_or(DEFAULT_THRESHOLD),
         }),
-        Some(Action::Artifacts { days, .. }) => Some(Action::Artifacts { days, all }),
+        Some(Action::Artifacts { days, .. }) => Some(Action::Artifacts {
+            days,
+            all,
+            trash,
+            assume_yes,
+        }),
         other => other,
     };
 

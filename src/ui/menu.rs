@@ -1,6 +1,6 @@
 //! Interactive mode: the start screen and the action menu after a scan.
 
-use crate::app::{self, DupesMode};
+use crate::app::{self, ArtifactsMode, DupesMode};
 use crate::cli::RunOptions;
 use crate::core::artifacts::DEFAULT_ARTIFACT_DAYS;
 use crate::core::files::{DEFAULT_TOP, get_top_largest, is_document};
@@ -165,10 +165,23 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
                 );
                 prompt();
                 let answer = read_line_from_user();
-                if answer.eq_ignore_ascii_case("all") {
-                    app::show_artifacts(target_path, files, options, DEFAULT_ARTIFACT_DAYS, true);
-                } else if let Some(n) = days_from(&answer, DEFAULT_ARTIFACT_DAYS) {
-                    app::show_artifacts(target_path, files, options, n, false);
+                let scope = if answer.eq_ignore_ascii_case("all") {
+                    Some((DEFAULT_ARTIFACT_DAYS, true))
+                } else {
+                    days_from(&answer, DEFAULT_ARTIFACT_DAYS).map(|n| (n, false))
+                };
+                if let Some((n, all)) = scope
+                    && let Err(err) = app::handle_artifacts(
+                        target_path,
+                        files,
+                        options,
+                        n,
+                        all,
+                        ArtifactsMode::Choose,
+                    )
+                {
+                    error(&err.to_string());
+                    println!();
                 }
             }
             "?" | "help" | "menu" => {

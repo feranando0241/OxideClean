@@ -2,17 +2,10 @@
 
 use super::*;
 use crate::core::scanner::scan_directory;
-use crate::core::test_support::{Rng, no_progress, temp_dir};
+use crate::core::test_support::{Rng, no_progress, random_project, snapshot, temp_dir, write};
 
 const DAY: Duration = Duration::from_secs(86_400);
 const THRESHOLD: Duration = Duration::from_secs(90 * 86_400);
-
-/// Writes `size` bytes at `dir/path`, creating its folders.
-fn write(dir: &Path, path: &str, size: usize) {
-    let path = dir.join(path);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![0u8; size]).unwrap();
-}
 
 /// Scans `dir` with every file made to look untouched for 400 days. No tool
 /// can set a ctime back, so the dates are changed after the scan.
@@ -188,6 +181,42 @@ fn test_any_active_file_protects_the_project() {
 }
 
 #[test]
+fn test_recent_git_activity_protects_the_project() {
+    let dir = temp_dir("art_git");
+    rust_project(&dir);
+    write(&dir, ".git/index", 10);
+    // Just created, so Git looks used; every scanned file looks long forgotten
+    let found = find(&dir, &old_files(&dir));
+    fs::remove_dir_all(&dir).unwrap();
+    assert!(found.found.is_empty());
+    assert_eq!(found.active, 1);
+
+    // The repository can be above the project
+    let dir = temp_dir("art_git_above");
+    rust_project(&dir.join("crates/app"));
+    write(&dir, ".git/HEAD", 10);
+    let found = find(&dir, &old_files(&dir));
+    fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(found.active, 1);
+}
+
+#[test]
+fn test_programs_in_release_are_counted() {
+    let found = found_in("art_release", |dir| {
+        rust_project(dir);
+        write(dir, "target/release/notes.d", 10);
+        write(dir, "target/release/app", 10);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let program = dir.join("target/release/app");
+            fs::set_permissions(program, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    });
+    assert_eq!(found.found[0].built_programs, 1);
+}
+
+#[test]
 fn test_each_nested_project_is_judged_on_its_own_files() {
     let dir = temp_dir("art_nested");
     write(&dir, "package.json", 10);
@@ -333,95 +362,6 @@ fn test_every_project_lists_active_ones_marked_as_such() {
         "by default, only forgotten projects"
     );
     assert_eq!((default.active, default.not_judged), (1, 1));
-}
-
-/// Every file under `dir` with its content, without following symlinks and
-/// leaving out `skip`.
-#[cfg(unix)]
-fn snapshot(dir: &Path, skip: &[PathBuf]) -> BTreeMap<PathBuf, Vec<u8>> {
-    let mut files = BTreeMap::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(current) = pending.pop() {
-        for entry in fs::read_dir(&current).unwrap().flatten() {
-            let path = entry.path();
-            let kind = entry.file_type().unwrap();
-            if skip.contains(&path) {
-                continue;
-            }
-            if kind.is_dir() {
-                pending.push(path);
-            } else if kind.is_file() {
-                files.insert(path.clone(), fs::read(&path).unwrap());
-            }
-        }
-    }
-    files
-}
-
-/// Fills `project` with a random project or look-alike, returning the build
-/// folder it holds, if any.
-#[cfg(unix)]
-fn random_project(rng: &mut Rng, project: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::symlink;
-
-    let source = rng.bytes(200);
-    fs::create_dir_all(project.join("src")).unwrap();
-    fs::write(project.join("src/main.txt"), source).unwrap();
-    write(project, "README.md", 20);
-    write(project, ".git/HEAD", 20);
-    write(project, "build/user_data.txt", 20);
-
-    // What a build folder holds, with a link back into the source
-    let fill = |artifact: &Path| {
-        write(artifact, "deep/er/generated.bin", 300);
-        symlink(project.join("src/main.txt"), artifact.join("link")).unwrap();
-    };
-    match rng.below(7) {
-        0 => {
-            write(project, "Cargo.toml", 20);
-            if rng.below(2) == 0 {
-                write(project, "Cargo.lock", 20);
-            }
-            write(project, "target/CACHEDIR.TAG", 20);
-            fill(&project.join("target"));
-            Some(project.join("target"))
-        }
-        1 => {
-            write(project, "package.json", 20);
-            if rng.below(2) == 0 {
-                write(project, "package-lock.json", 20);
-            }
-            fs::create_dir(project.join("node_modules")).unwrap();
-            fill(&project.join("node_modules"));
-            Some(project.join("node_modules"))
-        }
-        2 => {
-            write(project, "requirements.txt", 20);
-            write(project, ".venv/pyvenv.cfg", 20);
-            fill(&project.join(".venv"));
-            Some(project.join(".venv"))
-        }
-        // Look-alikes: they must survive
-        3 => {
-            write(project, "Cargo.toml", 20);
-            write(project, "target/thesis.pdf", 20);
-            None
-        }
-        4 => {
-            write(project, "target/CACHEDIR.TAG", 20);
-            write(project, "target/thesis.pdf", 20);
-            None
-        }
-        5 => {
-            write(project, "node_modules/thesis.pdf", 20);
-            None
-        }
-        _ => {
-            write(project, "requirements.txt", 20);
-            write(project, "venv/thesis.pdf", 20);
-            None
-        }
-    }
 }
 
 /// The promise behind any future cleanup, whatever the project: what gets

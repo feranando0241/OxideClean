@@ -423,6 +423,33 @@ fn artifacts_all_lists_active_projects_without_touching_them() {
     assert!(still_there, "--artifacts --all is read-only");
 }
 
+#[test]
+fn artifacts_yes_never_moves_an_active_project() {
+    let dir = fixture("artifacts_yes");
+    fs::write(dir.join("package.json"), "{}").unwrap();
+    fs::write(dir.join("package-lock.json"), "{}").unwrap();
+    fs::create_dir(dir.join("node_modules")).unwrap();
+    fs::write(dir.join("node_modules/a.js"), "x").unwrap();
+
+    let yes = run(&[path_str(&dir), "--artifacts", "--trash", "--yes"], "");
+    let all_yes = run(
+        &[path_str(&dir), "--artifacts", "--all", "--trash", "-y"],
+        "",
+    );
+    // Choosing needs someone to ask
+    let no_terminal = run(&[path_str(&dir), "--artifacts", "--all", "--trash"], "");
+    let still_there = dir.join("node_modules/a.js").exists();
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(yes.status.code(), Some(0));
+    assert!(stdout(&yes).contains("Nothing was moved."));
+    assert_eq!(all_yes.status.code(), Some(2));
+    assert!(stderr(&all_yes).contains("--yes can't be used with --all"));
+    assert_eq!(no_terminal.status.code(), Some(1));
+    assert!(stderr(&no_terminal).contains("no terminal to ask"));
+    assert!(still_there);
+}
+
 /// Runs a program in `dir`, failing the test if it doesn't work, and returns
 /// what it printed.
 fn run_in(dir: &Path, program: &str, args: &[&str]) -> String {

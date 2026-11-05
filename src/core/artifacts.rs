@@ -72,6 +72,21 @@ pub struct Artifact {
     /// The command that rebuilds it, if anything records what to install.
     pub rebuild: Option<&'static str>,
     pub confidence: Confidence,
+    /// Programs in `target/release`, which `cargo build` doesn't bring back.
+    pub built_programs: usize,
+}
+
+impl Artifact {
+    /// True if it may be moved at all: Rust or Node with a lockfile.
+    pub fn can_move(&self) -> bool {
+        self.kind != ArtifactKind::Python && self.confidence == Confidence::Pinned
+    }
+
+    /// True for the clear-cut case that may move without being chosen one by
+    /// one: a forgotten project, with nothing that a plain rebuild won't restore.
+    pub fn moves_unattended(&self) -> bool {
+        self.can_move() && self.state == ProjectState::Forgotten && self.built_programs == 0
+    }
 }
 
 /// What `find_artifacts` found, including what it left alone and why.
@@ -90,12 +105,12 @@ pub struct Artifacts {
 }
 
 /// A build folder recognized in some project, not yet judged or measured.
-struct Candidate {
-    path: PathBuf,
-    kind: ArtifactKind,
+pub(crate) struct Candidate {
+    pub(crate) path: PathBuf,
+    pub(crate) kind: ArtifactKind,
     rebuild: Option<&'static str>,
-    confidence: Confidence,
-    verified: bool,
+    pub(crate) confidence: Confidence,
+    pub(crate) verified: bool,
 }
 
 /// True for a real folder: a symlink never counts as an artifact.
@@ -104,7 +119,7 @@ fn is_real_dir(path: &Path) -> bool {
 }
 
 /// The build folders in `dir`, as far as the closed list of ADR-0005 goes.
-fn candidates_in(dir: &Path) -> Vec<Candidate> {
+pub(crate) fn candidates_in(dir: &Path) -> Vec<Candidate> {
     let mut found = Vec::new();
 
     let target = dir.join("target");
@@ -167,11 +182,21 @@ fn candidates_in(dir: &Path) -> Vec<Candidate> {
     found
 }
 
+/// What `measure` learned about a folder.
+pub(crate) struct Measured {
+    pub(crate) size: Usage,
+    /// Entries that couldn't be read.
+    unreadable: usize,
+    /// The most recent modification of a file inside.
+    pub(crate) newest: Option<SystemTime>,
+}
+
 /// Adds up what's inside `dir` without following symlinks, counting hardlinks
-/// once. Also returns how many entries couldn't be read.
-fn measure(dir: &Path) -> (Usage, usize) {
+/// once.
+pub(crate) fn measure(dir: &Path) -> Measured {
     let mut size = Usage::default();
     let mut unreadable = 0;
+    let mut newest: Option<SystemTime> = None;
     let mut seen = HashSet::new();
     let mut pending = vec![dir.to_path_buf()];
 
@@ -189,6 +214,9 @@ fn measure(dir: &Path) -> (Usage, usize) {
             match (entry.file_type(), entry.metadata()) {
                 (Ok(kind), _) if kind.is_dir() => pending.push(path),
                 (Ok(kind), Ok(metadata)) if kind.is_file() => {
+                    if let Ok(modified) = metadata.modified() {
+                        newest = Some(newest.map_or(modified, |n| n.max(modified)));
+                    }
                     if FileId::of(&path).is_none_or(|id| seen.insert(id)) {
                         size.bytes += metadata.len();
                         size.files += 1;
@@ -200,12 +228,63 @@ fn measure(dir: &Path) -> (Usage, usize) {
             }
         }
     }
-    (size, unreadable)
+    Measured {
+        size,
+        unreadable,
+        newest,
+    }
+}
+
+/// How many programs a Cargo build folder holds in `release/`, the only
+/// copy of them that `cargo build` won't bring back.
+fn built_programs(target: &Path) -> usize {
+    fs::read_dir(target.join("release")).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && entry.metadata().is_ok_and(|m| is_program(&m))
+            })
+            .count()
+    })
+}
+
+#[cfg(unix)]
+fn is_program(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_program(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+/// True if Git shows use within `threshold`: commits, checkouts and pulls can
+/// happen without a scanned file changing. The repository may be above `dir`.
+fn git_used_recently(dir: &Path, now: SystemTime, threshold: Duration) -> bool {
+    let Some(git) = dir
+        .ancestors()
+        .map(|folder| folder.join(".git"))
+        .find(|git| git.is_dir())
+    else {
+        return false;
+    };
+    ["index", "HEAD", "FETCH_HEAD", "ORIG_HEAD"]
+        .iter()
+        .any(|name| {
+            fs::metadata(git.join(name))
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| {
+                    now.duration_since(modified)
+                        .map_or(true, |age| age <= threshold)
+                })
+        })
 }
 
 /// How the files under one folder were judged.
 #[derive(Default)]
-struct Activity {
+pub(crate) struct Activity {
     in_use: bool,
     not_judged: bool,
     /// Shortest time untouched among its files.
@@ -223,15 +302,44 @@ impl Activity {
             self.untouched = Some(self.untouched.map_or(age, |shortest| shortest.min(age)));
         }
     }
+}
 
-    fn state(&self) -> ProjectState {
-        if self.in_use {
-            ProjectState::Active
-        } else if self.not_judged {
-            ProjectState::NotJudged
-        } else {
-            ProjectState::Forgotten
+/// Each folder up to `root` with how the scanned files under it were judged.
+pub(crate) fn activity_by_folder<'a>(
+    files: &'a [FileInfo],
+    root: &Path,
+    now: SystemTime,
+    threshold: Duration,
+) -> BTreeMap<&'a Path, Activity> {
+    let mut folders: BTreeMap<&Path, Activity> = BTreeMap::new();
+    for file in files {
+        let verdict = judge(file, now, threshold);
+        let untouched = untouched_for(file, now);
+        for dir in file
+            .path
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(root))
+        {
+            folders.entry(dir).or_default().record(verdict, untouched);
         }
+    }
+    folders
+}
+
+/// Whether the project in `dir` is in use, from its files and its Git activity.
+pub(crate) fn project_state(
+    dir: &Path,
+    activity: &Activity,
+    now: SystemTime,
+    threshold: Duration,
+) -> ProjectState {
+    if activity.in_use || git_used_recently(dir, now, threshold) {
+        ProjectState::Active
+    } else if activity.not_judged {
+        ProjectState::NotJudged
+    } else {
+        ProjectState::Forgotten
     }
 }
 
@@ -247,20 +355,7 @@ pub fn find_artifacts(
     every_project: bool,
     on_progress: Progress,
 ) -> Artifacts {
-    // Each file counts for every folder above it, up to the scanned root
-    let mut folders: BTreeMap<&Path, Activity> = BTreeMap::new();
-    for file in files {
-        let verdict = judge(file, now, threshold);
-        let untouched = untouched_for(file, now);
-        for dir in file
-            .path
-            .ancestors()
-            .skip(1)
-            .take_while(|dir| dir.starts_with(root))
-        {
-            folders.entry(dir).or_default().record(verdict, untouched);
-        }
-    }
+    let folders = activity_by_folder(files, root, now, threshold);
 
     let mut report = Artifacts::default();
     let mut listed = Vec::new();
@@ -269,7 +364,7 @@ pub fn find_artifacts(
             if excluded.iter().any(|e| candidate.path.starts_with(e)) {
                 continue;
             }
-            let state = activity.state();
+            let state = project_state(dir, activity, now, threshold);
             match state {
                 ProjectState::Active if !every_project => report.active += 1,
                 ProjectState::NotJudged if !every_project => report.not_judged += 1,
@@ -282,7 +377,13 @@ pub fn find_artifacts(
     on_progress(0, listed.len());
     let total = listed.len();
     for (done, (project, candidate, state, untouched)) in listed.into_iter().enumerate() {
-        let (size, unreadable) = measure(&candidate.path);
+        let measured = measure(&candidate.path);
+        let size = measured.size;
+        let programs = if candidate.kind == ArtifactKind::Rust {
+            built_programs(&candidate.path)
+        } else {
+            0
+        };
         report.total.bytes += size.bytes;
         report.total.files += size.files;
         report.found.push(Artifact {
@@ -290,11 +391,12 @@ pub fn find_artifacts(
             path: candidate.path,
             kind: candidate.kind,
             size,
-            unreadable,
+            unreadable: measured.unreadable,
             state,
             untouched,
             rebuild: candidate.rebuild,
             confidence: candidate.confidence,
+            built_programs: programs,
         });
         on_progress(done + 1, total);
     }

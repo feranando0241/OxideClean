@@ -77,13 +77,16 @@ oxide_clean ~/Downloads --old 365            # untouched for more than a year
 oxide_clean ~ --artifacts                    # build folders of projects untouched for 90+ days
 oxide_clean ~ --artifacts 30 --exclude Work  # 30 days, leaving a folder out
 oxide_clean ~ --artifacts --all              # every project, marking the active ones
+oxide_clean ~ --artifacts --trash            # choose which to move to the Trash
+oxide_clean ~ --artifacts --all --trash      # same, with active projects to choose from
+oxide_clean ~ --artifacts --trash -y         # move the clear-cut ones without asking
 oxide_clean ~/Documents --similar thesis.pdf --threshold 50
 oxide_clean --help
 ```
 
 - `--dupes` on its own never deletes anything.
 - `--old [DAYS]` only lists; it never moves or changes anything. See [How forgotten files are found](#how-forgotten-files-are-found).
-- `--artifacts [DAYS]` only lists too; `--all` adds the projects in use. See [How build folders are found](#how-build-folders-are-found).
+- `--artifacts [DAYS]` only lists too; `--all` adds the projects in use, and `--trash` moves the ones you choose. See [How build folders are found](#how-build-folders-are-found).
 - `--keep-in <FOLDER>` keeps, in each group, every copy inside that folder instead of the oldest, so nothing inside it is ever moved (groups without a copy there keep the oldest). If the folder doesn't exist or holds no copy at all, the run stops with an error and nothing is moved, so a typo can't make `--trash --yes` remove the copies you meant to keep.
 - `--exclude <FOLDER>` leaves a folder out of the scan; repeat it for several. Folders are relative to the scanned path, or full paths; `..` and symlinks to a folder inside the scan work too.
 - `--no-cache` doesn't reuse or save file hashes between runs.
@@ -205,7 +208,7 @@ Details and measurements: [ADR-0004](docs/adr/0004-forgotten-files.md).
 
 ## How build folders are found
 
-`--artifacts` (menu option 9) lists folders that compilers and package managers generate, in projects you haven't touched for 90 days. It only lists and measures: nothing is moved, and no project tool such as `cargo` or `npm` is run, because that would execute the project's own code.
+`--artifacts` (menu option 9) lists folders that compilers and package managers generate, in projects you haven't touched for 90 days. On its own it only lists and measures. No project tool such as `cargo` or `npm` is ever run, because that would execute the project's own code.
 
 | Type | Folder | Must also have | Rated reliable when |
 |---|---|---|---|
@@ -214,13 +217,25 @@ Details and measurements: [ADR-0004](docs/adr/0004-forgotten-files.md).
 | Python | `.venv/`, `venv/` | `pyvenv.cfg` inside it | Never: few projects record exact versions |
 
 - **A closed list:** any other folder is ignored, whatever its name. Hidden folders aren't searched, which keeps the `node_modules` of your editor's extensions out.
-- **One recent file protects the whole project**, using the same rules as forgotten files. Projects in use, or that arrived in the last 30 days, are only counted.
+- **One recent file protects the whole project**, using the same rules as forgotten files, and so does recent Git activity. Projects in use, or that arrived in the last 30 days, are only counted.
 - **`--all` shows every project** with its state, because active projects pile up build files too. In the menu, answer `all`. The closed list still applies: `--all` drops the activity rule, not the others.
 - **`(!)` marks a folder whose rebuild may not give the same result**, and any old project can fail to rebuild if a package or tool has moved on.
 
-Sizes are logical file sizes, usually a little below what `du` shows. Details: [ADR-0005](docs/adr/0005-build-artifacts.md).
+Sizes are logical file sizes, usually a little below what `du` shows.
 
-**Tested promise:** a property test builds random projects mixed with look-alikes (a `target` holding a thesis, a `venv` without `pyvenv.cfg`), lists them and removes what was listed: exactly the build folders must go, and every other file must stay identical byte for byte. End-to-end tests take a real Rust project and a real Node project through build, removal and rebuild, and run the result.
+**Moving to the Trash.** With `--trash`, or from the menu, you choose what to move. Space comes back when you empty the Trash.
+
+| Case | Can it move? |
+|---|---|
+| Forgotten project, Rust or Node with a lockfile, no programs in `target/release` | Yes: the only case `y` and `--yes` reach |
+| Active project, one that can't be judged, or `(bin)`: programs in `target/release` | Only by number, and after typing `yes` |
+| Python environment or no lockfile (`-` in the list) | No |
+
+Right before each move, the tool checks from disk that the folder still qualifies, that a forgotten project wasn't used since the list, and that nothing inside changed in the last 10 minutes, which could mean a build is running. Anything that fails stays where it is, with the reason shown. `--all --trash --yes` is rejected, so a script can never reach an active project.
+
+Details: [ADR-0005](docs/adr/0005-build-artifacts.md).
+
+**Tested promise:** a property test builds random projects mixed with look-alikes (a `target` holding a thesis, a `venv` without `pyvenv.cfg`) and runs the real move on them, with a fake Trash: exactly the movable build folders must go, and every other file must stay identical byte for byte. End-to-end tests take a real Rust project and a real Node project through build, removal and rebuild, and run the result.
 
 ---
 
@@ -247,7 +262,8 @@ src/
 │   ├── scanner.rs     — Recursive directory scanning and ignore rules
 │   ├── files.rs       — Biggest files, by type, same name, where the space goes
 │   ├── old_files.rs   — Forgotten files: untouched for months (ADR-0004)
-│   ├── artifacts.rs   — Build folders in forgotten projects (ADR-0005)
+│   ├── artifacts.rs   — Finding build folders in projects (ADR-0005)
+│   ├── artifact_trash.rs — Moving them to the Trash, re-verified from disk
 │   ├── duplicates/    — Everything about identical files
 │   │   ├── mod.rs        — Finding them (size → prefix → full hash)
 │   │   ├── hashing.rs    — Full and 4 KB prefix SHA-256, parallel hashing (private to duplicates/)
@@ -258,7 +274,7 @@ src/
 │   ├── style.rs       — Colors, titles, prompts, text helpers
 │   ├── report.rs      — Result screens
 │   ├── duplicates.rs  — Choosing which duplicate groups to move and what to keep
-│   ├── artifacts.rs   — The build folders screen
+│   ├── artifacts.rs   — The build folders screens: list, choosing, results
 │   ├── input.rs       — Reading lines, paths and group selections
 │   ├── menu.rs        — Start screen and action menu
 │   ├── browser.rs     — Folder browser

@@ -110,7 +110,8 @@ fn test_usage_errors() {
         ". --all",
         ". --dupes --all",
         ". --artifacts 300000000000000",
-        ". --artifacts 30 --trash",
+        ". --artifacts -y",
+        ". --artifacts --all --trash -y",
         ". --old 300000000000000",
         ". --old 30 --trash",
         ". --old 30 --threshold 5",
@@ -123,7 +124,31 @@ fn test_usage_errors() {
 
 #[test]
 fn test_old_days_are_optional() {
-    let artifacts = |days, all| run(".", Some(Action::Artifacts { days, all }));
+    let artifacts = |days, all| {
+        run(
+            ".",
+            Some(Action::Artifacts {
+                days,
+                all,
+                trash: false,
+                assume_yes: false,
+            }),
+        )
+    };
+    let trashing = |all, assume_yes| {
+        run(
+            ".",
+            Some(Action::Artifacts {
+                days: DEFAULT_ARTIFACT_DAYS,
+                all,
+                trash: true,
+                assume_yes,
+            }),
+        )
+    };
+    assert_eq!(parse(". --artifacts --trash"), trashing(false, false));
+    assert_eq!(parse(". --artifacts --trash -y"), trashing(false, true));
+    assert_eq!(parse(". --artifacts --all --trash"), trashing(true, false));
     assert_eq!(
         parse(". --artifacts"),
         artifacts(DEFAULT_ARTIFACT_DAYS, false)
