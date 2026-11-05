@@ -45,32 +45,42 @@ pub enum Verdict {
 /// Judges one file. `now` is a parameter, not the clock, so the same input
 /// always gives the same answer (and tests can pick any moment).
 pub fn judge(file: &FileInfo, now: SystemTime, threshold: Duration) -> Verdict {
-    let Some(modified) = file.modified else {
-        return Verdict::NoDate;
+    let Some(untouched) = untouched_for(file, now) else {
+        return if file.modified.is_none() {
+            Verdict::NoDate
+        } else {
+            Verdict::FutureDate
+        };
     };
-    if [Some(modified), file.accessed, file.changed]
-        .iter()
-        .flatten()
-        .any(|&t| t > now)
-    {
-        return Verdict::FutureDate;
-    }
-    // No timestamp is in the future past this point
-    let age = |t: SystemTime| now.duration_since(t).unwrap_or_default();
-
-    // Untouched since the most recent change or recorded read
-    let untouched = file
-        .accessed
-        .map_or(age(modified), |read| age(read).min(age(modified)));
     if untouched <= threshold {
         return Verdict::InUse;
     }
 
     let grace = days(ARRIVAL_GRACE_DAYS).expect("the grace fits in a Duration");
     match file.changed {
-        Some(arrived) if age(arrived) < grace => Verdict::JustArrived,
+        Some(arrived) if now.duration_since(arrived).unwrap_or_default() < grace => {
+            Verdict::JustArrived
+        }
         _ => Verdict::Forgotten(untouched),
     }
+}
+
+/// How long since the file's most recent change or recorded read, or `None`
+/// if it can't be told: no modification time, or a timestamp later than `now`.
+pub fn untouched_for(file: &FileInfo, now: SystemTime) -> Option<Duration> {
+    let modified = file.modified?;
+    if [Some(modified), file.accessed, file.changed]
+        .iter()
+        .flatten()
+        .any(|&t| t > now)
+    {
+        return None;
+    }
+    let age = |t: SystemTime| now.duration_since(t).unwrap_or_default();
+    Some(
+        file.accessed
+            .map_or(age(modified), |read| age(read).min(age(modified))),
+    )
 }
 
 /// A forgotten file and how long it has been untouched.

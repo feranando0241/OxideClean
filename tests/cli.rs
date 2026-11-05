@@ -384,6 +384,160 @@ fn interactive_old_files_asks_for_days() {
 }
 
 #[test]
+fn artifacts_lists_nothing_while_a_project_is_active() {
+    // Everything was just created, so the project counts as in use
+    let dir = fixture("artifacts_active");
+    fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+    fs::create_dir(dir.join("target")).unwrap();
+    fs::write(dir.join("target/CACHEDIR.TAG"), "tag").unwrap();
+    let out = run(&[path_str(&dir), "--artifacts"], "");
+    let still_there = dir.join("target/CACHEDIR.TAG").exists();
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout(&out);
+    assert!(text.contains("projects untouched for 90+ days"));
+    assert!(text.contains("None found."));
+    assert!(text.contains("1 build folder left alone"));
+    assert!(text.contains("Nothing was moved or changed."));
+    assert!(still_there, "--artifacts is read-only");
+}
+
+#[test]
+fn artifacts_all_lists_active_projects_without_touching_them() {
+    let dir = fixture("artifacts_all");
+    fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+    fs::create_dir(dir.join("target")).unwrap();
+    fs::write(dir.join("target/CACHEDIR.TAG"), "tag").unwrap();
+    let out = run(&[path_str(&dir), "--artifacts", "--all"], "");
+    let still_there = dir.join("target/CACHEDIR.TAG").exists();
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout(&out);
+    assert!(text.contains("Build folders in every project"));
+    assert!(text.contains("active"));
+    assert!(text.contains("cargo build"));
+    assert!(text.contains("in active projects"));
+    assert!(text.contains("Nothing was moved or changed."));
+    assert!(still_there, "--artifacts --all is read-only");
+}
+
+/// Runs a program in `dir`, failing the test if it doesn't work, and returns
+/// what it printed.
+fn run_in(dir: &Path, program: &str, args: &[&str]) -> String {
+    let out = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .unwrap_or_else(|e| panic!("couldn't run {}: {}", program, e));
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{} {:?} failed:\n{}",
+        program,
+        args,
+        text
+    );
+    text
+}
+
+/// A real project goes through the whole cycle: build, get listed, lose its
+/// build folder, build again from the command shown, and still work.
+#[test]
+fn rust_project_rebuilds_after_losing_what_is_listed() {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let dir = std::env::temp_dir().join(format!("oxide_clean_it_rebuild_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    let manifest =
+        "[package]\nname = \"hello\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n";
+    let source = "fn main() { println!(\"still works\"); }\n";
+    fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+    fs::write(dir.join("src/main.rs"), source).unwrap();
+    run_in(&dir, &cargo, &["build", "--offline", "--quiet"]);
+
+    let listed = stdout(&run(&[path_str(&dir), "--artifacts", "--all"], ""));
+    assert!(listed.contains("cargo build"), "not listed:\n{}", listed);
+
+    fs::remove_dir_all(dir.join("target")).unwrap();
+    let source_kept = fs::read_to_string(dir.join("src/main.rs")).unwrap() == source;
+    let manifest_kept = fs::read_to_string(dir.join("Cargo.toml")).unwrap() == manifest;
+    let lock_kept = dir.join("Cargo.lock").exists();
+    run_in(&dir, &cargo, &["build", "--offline", "--quiet"]);
+    let printed = run_in(&dir.join("target/debug"), "./hello", &[]);
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(source_kept && manifest_kept && lock_kept);
+    assert!(printed.contains("still works"));
+}
+
+/// Same cycle for Node, with a dependency on a local package so no network
+/// is needed. Skipped, saying so, where npm isn't installed.
+#[test]
+fn node_project_reinstalls_after_losing_what_is_listed() {
+    let installed = Command::new("npm").arg("--version").output();
+    if !installed.is_ok_and(|out| out.status.success()) {
+        eprintln!("npm isn't installed: skipping the Node rebuild check");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("oxide_clean_it_npm_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("lib")).unwrap();
+    fs::write(
+        dir.join("lib/package.json"),
+        r#"{"name":"lib","version":"1.0.0","main":"index.js"}"#,
+    )
+    .unwrap();
+    fs::write(dir.join("lib/index.js"), "module.exports = 'still works';").unwrap();
+    fs::write(
+        dir.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"lib":"file:./lib"}}"#,
+    )
+    .unwrap();
+    let flags = ["--offline", "--no-audit", "--no-fund"];
+    run_in(&dir, "npm", &[&["install"], &flags[..]].concat());
+
+    let listed = stdout(&run(&[path_str(&dir), "--artifacts", "--all"], ""));
+    assert!(listed.contains("npm ci"), "not listed:\n{}", listed);
+
+    fs::remove_dir_all(dir.join("node_modules")).unwrap();
+    let local_package_kept = dir.join("lib/index.js").exists();
+    run_in(&dir, "npm", &[&["ci"], &flags[..]].concat());
+    let printed = run_in(&dir, "node", &["-p", "require('lib')"]);
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        local_package_kept,
+        "the package source isn't a build folder"
+    );
+    assert!(printed.contains("still works"));
+}
+
+#[test]
+fn artifacts_rejects_unusable_thresholds() {
+    let out = run(&[".", "--artifacts", "0"], "");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr(&out).contains("--artifacts needs at least 1 day"));
+    assert!(stdout(&run(&["--help"], "")).contains("--artifacts [DAYS]"));
+}
+
+#[test]
+fn interactive_build_folders_asks_for_days() {
+    let dir = fixture("interactive_artifacts");
+    let input = format!("{}\n9\n\n9\nabc\n9\nall\n0\nq\n", path_str(&dir));
+    let out = run(&[], &input);
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(out.status.code(), Some(0));
+    assert!(stdout(&out).contains("projects untouched for 90+ days"));
+    assert!(stdout(&out).contains("Build folders in every project"));
+    assert!(stderr(&out).contains("press Enter for 90"));
+}
+
+#[test]
 fn interactive_quit() {
     let out = run(&[], "q\n");
     assert_eq!(out.status.code(), Some(0));

@@ -2,6 +2,7 @@
 
 use crate::app::{self, DupesMode};
 use crate::cli::RunOptions;
+use crate::core::artifacts::DEFAULT_ARTIFACT_DAYS;
 use crate::core::files::{DEFAULT_TOP, get_top_largest, is_document};
 use crate::core::models::FileInfo;
 use crate::core::old_files::{DEFAULT_OLD_DAYS, days};
@@ -89,7 +90,7 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
         if !show_full_menu {
             hint("1 all files · 2 biggest · 3 by type · 4 folders · 5 identical copies");
             hint(
-                "6 same name · 7 similar docs · 8 untouched files · ? full menu · 0 another folder",
+                "6 same name · 7 similar docs · 8 untouched files · 9 build folders · ? full menu · 0 another folder",
             );
         } else {
             show_full_menu = false;
@@ -103,6 +104,7 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
             println!("    5  Find identical copies of files (and free up space)");
             println!("    6  Find files with the same name in different places");
             println!("    8  Find big files nobody has touched in months");
+            println!("    9  Find build folders of projects you stopped working on");
             hint("\n  Compare documents");
             println!("    7  Find documents with similar content");
             println!();
@@ -152,23 +154,21 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
                 run_similarity_steps(target_path, files);
             }
             "8" => {
+                if let Some(n) = ask_days(DEFAULT_OLD_DAYS) {
+                    app::show_old_files(target_path, files, n);
+                }
+            }
+            "9" => {
                 println!(
-                    "\nUntouched for more than how many days? (Enter for {})",
-                    DEFAULT_OLD_DAYS
+                    "\nUntouched for more than how many days? (Enter for {}, or all for every project)",
+                    DEFAULT_ARTIFACT_DAYS
                 );
                 prompt();
                 let answer = read_line_from_user();
-                let n = if answer.is_empty() {
-                    Some(DEFAULT_OLD_DAYS)
-                } else {
-                    answer.parse::<u64>().ok().filter(|&n| days(n).is_some())
-                };
-                match n {
-                    Some(n) => app::show_old_files(target_path, files, n),
-                    None => error(&format!(
-                        "Type a number of days greater than 0, or press Enter for {}.",
-                        DEFAULT_OLD_DAYS
-                    )),
+                if answer.eq_ignore_ascii_case("all") {
+                    app::show_artifacts(target_path, files, options, DEFAULT_ARTIFACT_DAYS, true);
+                } else if let Some(n) = days_from(&answer, DEFAULT_ARTIFACT_DAYS) {
+                    app::show_artifacts(target_path, files, options, n, false);
                 }
             }
             "?" | "help" | "menu" => {
@@ -178,10 +178,37 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
                 break;
             }
             _ => {
-                error("That's not an option. Type a number from 0 to 8, or ? to see the menu.");
+                error("That's not an option. Type a number from 0 to 9, or ? to see the menu.");
             }
         }
     }
+}
+
+/// Asks for a number of days (Enter takes `default`).
+fn ask_days(default: u64) -> Option<u64> {
+    println!(
+        "\nUntouched for more than how many days? (Enter for {})",
+        default
+    );
+    prompt();
+    days_from(&read_line_from_user(), default)
+}
+
+/// The number of days in `answer` (empty takes `default`), saying so if it
+/// can't be used.
+fn days_from(answer: &str, default: u64) -> Option<u64> {
+    let n = if answer.is_empty() {
+        Some(default)
+    } else {
+        answer.parse::<u64>().ok().filter(|&n| days(n).is_some())
+    };
+    if n.is_none() {
+        error(&format!(
+            "Type a number of days greater than 0, or press Enter for {}.",
+            default
+        ));
+    }
+    n
 }
 
 /// Guides the user through the similarity comparison: pick a document,

@@ -4,6 +4,7 @@
 //! lives here, in one place.
 
 use crate::cli::{Action, RunOptions};
+use crate::core::artifacts::find_artifacts;
 use crate::core::duplicates::hash_cache::HashCache;
 use crate::core::duplicates::trash::trash_duplicates;
 use crate::core::duplicates::{DuplicateGroup, find_exact_duplicates, keep_copies_inside};
@@ -13,6 +14,7 @@ use crate::core::old_files::{days, find_old_files};
 use crate::core::paths::{folder_in_scan, in_scan_form};
 use crate::core::scanner::scan_directory;
 use crate::core::similarity::{SimilarityError, find_similar_documents};
+use crate::ui::artifacts::print_artifacts;
 use crate::ui::duplicates::choose_groups_to_trash;
 use crate::ui::input::{read_line_from_user, resolve_user_path};
 use crate::ui::progress::Spinner;
@@ -164,6 +166,7 @@ pub fn run_action(root: &Path, action: Action, options: &RunOptions) -> Result<(
         }
         Action::SameName => show_same_name_files(root, &files),
         Action::Old(n) => show_old_files(root, &files, n),
+        Action::Artifacts { days, all } => show_artifacts(root, &files, options, days, all),
         Action::Similar { file, threshold } => {
             let target = locate_base_file(root, &file)?;
             show_similar_documents(root, &target, &files, threshold)?;
@@ -218,6 +221,32 @@ pub fn show_old_files(root: &Path, files: &[FileInfo], n: u64) {
     // just because it was written during the scan
     let now = SystemTime::now();
     print_old_files(root, &find_old_files(files, now, threshold), n);
+}
+
+/// Prints the build folders of projects untouched for more than `n` days (see
+/// ADR-0005), or of every project with `all`. `n` must be a valid threshold,
+/// like in `show_old_files`.
+pub fn show_artifacts(root: &Path, files: &[FileInfo], options: &RunOptions, n: u64, all: bool) {
+    let threshold = days(n).expect("the caller checked the number of days");
+    let excluded: Vec<PathBuf> = options
+        .exclude
+        .iter()
+        .map(|folder| folder_in_scan(root, &resolve_user_path(folder)))
+        .collect();
+    let now = SystemTime::now();
+    let report = {
+        let spinner = Spinner::start("Measuring build folders", "folders");
+        find_artifacts(
+            files,
+            root,
+            &excluded,
+            now,
+            threshold,
+            all,
+            &|done, total| spinner.update(done, total),
+        )
+    };
+    print_artifacts(root, &report, n, all);
 }
 
 /// Compares `target` with the other documents and prints the matches.

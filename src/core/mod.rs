@@ -8,6 +8,7 @@
 //!
 //! - `models`      FileInfo and FileId, shared by everything below
 //! - `old_files`   forgotten files: untouched for months (see ADR-0004)
+//! - `artifacts`   build folders in forgotten projects (see ADR-0005)
 //! - `paths`       matching folders typed by the user against scanned paths
 //! - `scanner`     directory walk and ignore rules
 //! - `files`       simple queries: biggest, by type, same name, space used
@@ -15,6 +16,7 @@
 //!   moving extra copies to the Trash
 //! - `similarity`  comparing documents by content
 
+pub mod artifacts;
 pub mod duplicates;
 pub mod files;
 pub mod models;

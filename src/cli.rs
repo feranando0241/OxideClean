@@ -3,9 +3,11 @@
 //! Hand-rolled on top of `std::env::args` to avoid a dependency while the
 //! interface is small. Move to `clap` once the ADR's revisit triggers are hit.
 
+use crate::core::artifacts::DEFAULT_ARTIFACT_DAYS;
 use crate::core::files::DEFAULT_TOP;
 use crate::core::old_files::{DEFAULT_OLD_DAYS, days};
 use crate::core::similarity::DEFAULT_THRESHOLD;
+use std::iter::Peekable;
 
 /// Text printed by `--help`.
 pub const HELP: &str = "\
@@ -27,6 +29,10 @@ ACTIONS:
     --old [DAYS]           Files neither modified nor read in DAYS days (default 180),
                            biggest first (read-only). Files that arrived on this
                            disk in the last 30 days are never listed
+    --artifacts [DAYS]     Build folders (target, node_modules, Python environments)
+                           in projects untouched for DAYS days (default 90), with
+                           how to rebuild them (read-only)
+      --all                ...in every project, marking the active ones
     --similar <FILE>       Documents with content similar to FILE
       --threshold <N>      Minimum similarity percentage (default 30)
 
@@ -62,6 +68,12 @@ pub enum Action {
     SameName,
     /// Files untouched for more than this many days (validated: at least 1).
     Old(u64),
+    /// Build folders of projects untouched for more than `days`; with `all`,
+    /// of every project, and `days` only decides which ones count as active.
+    Artifacts {
+        days: u64,
+        all: bool,
+    },
     Similar {
         file: String,
         threshold: f64,
@@ -115,6 +127,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut assume_yes = false;
     let mut keep_in: Option<String> = None;
     let mut threshold: Option<f64> = None;
+    let mut all = false;
 
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
@@ -135,20 +148,18 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                 keep_in: None,
             }),
             "--same-name" => Some(Action::SameName),
-            "--old" => {
-                // DAYS is optional, like N in --largest
-                let n = iter.peek().and_then(|v| v.parse::<u64>().ok());
-                if n.is_some() {
-                    iter.next();
-                }
-                let n = n.unwrap_or(DEFAULT_OLD_DAYS);
-                if n == 0 {
-                    return Err("--old needs at least 1 day".to_string());
-                }
-                if days(n).is_none() {
-                    return Err(format!("--old {} is too many days", n));
-                }
-                Some(Action::Old(n))
+            "--old" => Some(Action::Old(optional_days(
+                &mut iter,
+                "--old",
+                DEFAULT_OLD_DAYS,
+            )?)),
+            "--artifacts" => Some(Action::Artifacts {
+                days: optional_days(&mut iter, "--artifacts", DEFAULT_ARTIFACT_DAYS)?,
+                all: false,
+            }),
+            "--all" => {
+                all = true;
+                None
             }
             "--similar" => Some(Action::Similar {
                 file: take_value(&mut iter, "--similar")?,
@@ -215,6 +226,9 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     if assume_yes && !trash {
         return Err("--yes can only be used with --dupes --trash".to_string());
     }
+    if all && !matches!(action, Some(Action::Artifacts { .. })) {
+        return Err("--all can only be used with --artifacts".to_string());
+    }
     if threshold.is_some() && !matches!(action, Some(Action::Similar { .. })) {
         return Err("--threshold can only be used with --similar".to_string());
     }
@@ -228,6 +242,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             file,
             threshold: threshold.unwrap_or(DEFAULT_THRESHOLD),
         }),
+        Some(Action::Artifacts { days, .. }) => Some(Action::Artifacts { days, all }),
         other => other,
     };
 
@@ -248,6 +263,27 @@ fn take_value<'a>(
         Some(value) if !value.starts_with('-') => Ok(value.clone()),
         _ => Err(format!("{} needs a value", flag)),
     }
+}
+
+/// A flag's optional number of days, like N in --largest: the next argument
+/// is only taken if it is a number.
+fn optional_days<'a, I: Iterator<Item = &'a String>>(
+    iter: &mut Peekable<I>,
+    flag: &str,
+    default: u64,
+) -> Result<u64, String> {
+    let n = iter.peek().and_then(|v| v.parse::<u64>().ok());
+    if n.is_some() {
+        iter.next();
+    }
+    let n = n.unwrap_or(default);
+    if n == 0 {
+        return Err(format!("{} needs at least 1 day", flag));
+    }
+    if days(n).is_none() {
+        return Err(format!("{} {} is too many days", flag, n));
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
