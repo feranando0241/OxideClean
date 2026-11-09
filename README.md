@@ -80,6 +80,9 @@ oxide_clean ~ --artifacts --all              # every project, marking the active
 oxide_clean ~ --artifacts --trash            # choose which to move to the Trash
 oxide_clean ~ --artifacts --all --trash      # same, with active projects to choose from
 oxide_clean ~ --artifacts --trash -y         # move the clear-cut ones without asking
+oxide_clean ~/Downloads --organize type      # plan sorting the loose files by type (read-only)
+oxide_clean ~/Downloads --organize words --apply   # sort by words in the name (asks first)
+oxide_clean ~/Downloads --undo               # put back what --organize --apply moved
 oxide_clean ~/Documents --similar thesis.pdf --threshold 50
 oxide_clean --help
 ```
@@ -87,6 +90,7 @@ oxide_clean --help
 - `--dupes` on its own never deletes anything.
 - `--old [DAYS]` only lists; it never moves or changes anything. See [How forgotten files are found](#how-forgotten-files-are-found).
 - `--artifacts [DAYS]` only lists too; `--all` adds the projects in use, and `--trash` moves the ones you choose. See [How build folders are found](#how-build-folders-are-found).
+- `--organize year|size|type|words` only shows the plan; `--apply` moves, and `--undo` puts files back. See [How files are organized](#how-files-are-organized).
 - `--keep-in <FOLDER>` keeps, in each group, every copy inside that folder instead of the oldest, so nothing inside it is ever moved (groups without a copy there keep the oldest). If the folder doesn't exist or holds no copy at all, the run stops with an error and nothing is moved, so a typo can't make `--trash --yes` remove the copies you meant to keep.
 - `--exclude <FOLDER>` leaves a folder out of the scan; repeat it for several. Folders are relative to the scanned path, or full paths; `..` and symlinks to a folder inside the scan work too.
 - `--no-cache` doesn't reuse or save file hashes between runs.
@@ -239,6 +243,26 @@ Details: [ADR-0005](docs/adr/0005-build-artifacts.md).
 
 ---
 
+## How files are organized
+
+`--organize` (menu option 10) sorts the files **directly in the folder** into subfolders. Subfolders are never entered, so projects and macOS bundles like `.photoslibrary` stay whole, and hidden files stay where they are. On its own it only shows the plan.
+
+| By | Folders |
+|---|---|
+| `year` | `2024`, `2025`… from the modification date; `Unknown year` if there is none |
+| `size` | `Under 1 MB`, `1 MB to 100 MB`, `100 MB to 1 GB`, `Over 1 GB` |
+| `type` | `Images`, `Videos`, `Audio`, `Documents`, `Archives`, `Code`, `Other` |
+| `words` | `Projects` (proyecto, project), `Homework` (tarea, homework, assignment), `Websites` (website, sitio, web), `Solutions` (solución, solution), `Resumes` (resume, cv, currículum); then `PDF` and `CSV` by extension. Files with none stay put |
+
+- **Nothing is ever overwritten.** If the name is taken, the file stays and the reason is shown.
+- **Downloads in progress stay**, and so does anything changed in the last 10 minutes.
+- **Each file is checked again** right before it moves: one that changed since the plan stays.
+- **Every move is logged** in `.oxide_clean_organize.tsv` inside the folder. `--undo` (or `undo` in the menu) puts files back, newest first, again without overwriting. Whatever can't be put back stays in the log to retry.
+
+Moving onto exFAT or FAT32 drives isn't supported yet: those files are reported as not moved. Details: [ADR-0007](docs/adr/0007-organize-files.md).
+
+---
+
 ## Ignored directories and files
 
 OxideClean automatically skips folders and files that generate noise:
@@ -256,6 +280,7 @@ src/
 ├── main.rs            — Entry point: parse arguments, pick a mode
 ├── cli.rs             — Command-line argument parsing
 ├── app.rs             — Actions shared by the CLI and the menus (incl. Trash rules)
+├── app/               — Actions with their own file: organize.rs, similar.rs
 ├── core/              — Logic only: never prints, never reads input
 │   ├── models.rs      — FileInfo (size, dates) and FileId (identity of a file's data on disk)
 │   ├── paths.rs       — Matching folders typed by the user against scanned paths
@@ -264,6 +289,9 @@ src/
 │   ├── old_files.rs   — Forgotten files: untouched for months (ADR-0004)
 │   ├── artifacts.rs   — Finding build folders in projects (ADR-0005)
 │   ├── artifact_trash.rs — Moving them to the Trash, re-verified from disk
+│   ├── organize/      — Sorting loose files into folders (ADR-0007)
+│   │   ├── mod.rs        — Planning and moving, never overwriting
+│   │   └── log.rs        — The move log and undoing from it
 │   ├── duplicates/    — Everything about identical files
 │   │   ├── mod.rs        — Finding them (size → prefix → full hash)
 │   │   ├── hashing.rs    — Full and 4 KB prefix SHA-256, parallel hashing (private to duplicates/)
@@ -275,6 +303,7 @@ src/
 │   ├── report.rs      — Result screens
 │   ├── duplicates.rs  — Choosing which duplicate groups to move and what to keep
 │   ├── artifacts.rs   — The build folders screens: list, choosing, results
+│   ├── organize.rs    — The organize plan, questions and results
 │   ├── input.rs       — Reading lines, paths and group selections
 │   ├── menu.rs        — Start screen and action menu
 │   ├── browser.rs     — Folder browser

@@ -6,6 +6,7 @@
 use crate::core::artifacts::DEFAULT_ARTIFACT_DAYS;
 use crate::core::files::DEFAULT_TOP;
 use crate::core::old_files::{DEFAULT_OLD_DAYS, days};
+use crate::core::organize::OrganizeBy;
 use crate::core::similarity::DEFAULT_THRESHOLD;
 use std::iter::Peekable;
 
@@ -36,6 +37,15 @@ ACTIONS:
       --trash              ...and choose which to move to the Trash
       --yes, -y            ...move forgotten projects without asking, except those
                            with programs in target/release (not with --all)
+    --organize <BY>        Plan moving the files directly in PATH into folders by
+                           year, size, type or words (project, tarea, cv, pdf…).
+                           Subfolders and hidden files are left alone (read-only)
+      --apply              ...and move them (asks first). Nothing is overwritten,
+                           and each move is logged in PATH/.oxide_clean_organize.tsv
+      --yes, -y            ...without asking
+    --undo                 Put back every file --organize --apply moved in PATH,
+                           newest first, never overwriting (asks first)
+      --yes, -y            ...without asking
     --similar <FILE>       Documents with content similar to FILE
       --threshold <N>      Minimum similarity percentage (default 30)
 
@@ -82,6 +92,17 @@ pub enum Action {
     Similar {
         file: String,
         threshold: f64,
+    },
+    /// Move the loose files of PATH into folders; with `apply: false`, only
+    /// show where each would go.
+    Organize {
+        by: OrganizeBy,
+        apply: bool,
+        assume_yes: bool,
+    },
+    /// Put back what `Organize` moved, from the log in PATH.
+    Undo {
+        assume_yes: bool,
     },
 }
 
@@ -133,6 +154,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut keep_in: Option<String> = None;
     let mut threshold: Option<f64> = None;
     let mut all = false;
+    let mut apply = false;
 
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
@@ -164,6 +186,31 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                 trash: false,
                 assume_yes: false,
             }),
+            "--organize" => {
+                let raw = take_value(&mut iter, "--organize")?;
+                let by = match raw.as_str() {
+                    "year" => OrganizeBy::Year,
+                    "size" => OrganizeBy::Size,
+                    "type" => OrganizeBy::Type,
+                    "words" => OrganizeBy::Words,
+                    _ => {
+                        return Err(format!(
+                            "--organize must be year, size, type or words, got '{}'",
+                            raw
+                        ));
+                    }
+                };
+                Some(Action::Organize {
+                    by,
+                    apply: false,
+                    assume_yes: false,
+                })
+            }
+            "--undo" => Some(Action::Undo { assume_yes: false }),
+            "--apply" => {
+                apply = true;
+                None
+            }
             "--all" => {
                 all = true;
                 None
@@ -231,8 +278,12 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     if keep_in.is_some() && !is_dupes {
         return Err("--keep-in can only be used with --dupes".to_string());
     }
-    if assume_yes && !trash {
-        return Err("--yes can only be used with --trash".to_string());
+    if apply && !matches!(action, Some(Action::Organize { .. })) {
+        return Err("--apply can only be used with --organize".to_string());
+    }
+    let is_undo = matches!(action, Some(Action::Undo { .. }));
+    if assume_yes && !trash && !apply && !is_undo {
+        return Err("--yes can only be used with --trash, --apply or --undo".to_string());
     }
     if all && assume_yes {
         return Err("--yes can't be used with --all: active projects must be chosen".to_string());
@@ -259,6 +310,12 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             trash,
             assume_yes,
         }),
+        Some(Action::Organize { by, .. }) => Some(Action::Organize {
+            by,
+            apply,
+            assume_yes,
+        }),
+        Some(Action::Undo { .. }) => Some(Action::Undo { assume_yes }),
         other => other,
     };
 

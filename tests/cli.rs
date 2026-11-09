@@ -598,3 +598,53 @@ fn interactive_end_of_input_exits() {
     fs::remove_dir_all(&dir).unwrap();
     assert_eq!(out.status.code(), Some(0));
 }
+
+#[test]
+fn organize_plans_without_moving_and_protects_fresh_files() {
+    let dir = fixture("organize_plan");
+    let out = run(&[path_str(&dir), "--organize", "type", "--apply"], "");
+    let text = stdout(&out);
+    let kept = dir.join("notes.md").exists();
+    let _ = fs::remove_dir_all(&dir);
+    // notes.md was written moments ago, so it may still be in use
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(text.contains("Nothing to organize here."), "{}", text);
+    assert!(
+        text.contains("notes.md: it changed moments ago"),
+        "{}",
+        text
+    );
+    assert!(kept);
+}
+
+#[test]
+fn undo_asks_puts_files_back_and_removes_the_log() {
+    let dir = fixture("organize_undo");
+    let log = dir.join(".oxide_clean_organize.tsv");
+    fs::create_dir(dir.join("Documents")).unwrap();
+    fs::rename(dir.join("notes.md"), dir.join("Documents/notes.md")).unwrap();
+    fs::write(&log, "notes.md\tDocuments/notes.md\n").unwrap();
+
+    // No terminal to ask on: nothing moves
+    let refused = run(&[path_str(&dir), "--undo"], "y\n");
+    let still_moved = dir.join("Documents/notes.md").exists();
+    let done = run(&[path_str(&dir), "--undo", "--yes"], "");
+    let state = (
+        dir.join("notes.md").exists(),
+        dir.join("Documents").exists(),
+        log.exists(),
+    );
+    let again = run(&[path_str(&dir), "--undo"], "");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(still_moved);
+    assert!(done.status.success(), "stderr: {}", stderr(&done));
+    assert!(
+        stdout(&done).contains("Put back 1 file"),
+        "{}",
+        stdout(&done)
+    );
+    assert_eq!(state, (true, false, false));
+    assert!(stdout(&again).contains("Nothing to undo"));
+}

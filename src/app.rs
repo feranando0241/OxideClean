@@ -3,6 +3,12 @@
 //! same in both modes (especially the rules for moving files to the Trash)
 //! lives here, in one place.
 
+mod organize;
+mod similar;
+
+pub use organize::{handle_organize, handle_undo};
+pub use similar::show_similar_documents;
+
 use crate::cli::{Action, RunOptions};
 use crate::core::artifact_trash::trash_artifacts;
 use crate::core::artifacts::find_artifacts;
@@ -12,20 +18,19 @@ use crate::core::duplicates::{DuplicateGroup, find_exact_duplicates, keep_copies
 use crate::core::files::{filter_by_extension, find_same_name_files, get_top_largest};
 use crate::core::models::FileInfo;
 use crate::core::old_files::{days, find_old_files};
-use crate::core::paths::{folder_in_scan, in_scan_form};
+use crate::core::paths::folder_in_scan;
 use crate::core::scanner::scan_directory;
-use crate::core::similarity::{SimilarityError, find_similar_documents};
+use crate::core::similarity::SimilarityError;
 use crate::ui::artifacts::{choose_artifacts, print_artifact_trash_report, print_artifacts};
 use crate::ui::duplicates::choose_groups_to_trash;
 use crate::ui::input::{read_line_from_user, resolve_user_path};
 use crate::ui::progress::Spinner;
 use crate::ui::report::{
     print_exact_duplicates, print_filtered_files, print_old_files, print_same_name_results,
-    print_similarity_results, print_top_largest, print_trash_report,
+    print_top_largest, print_trash_report,
 };
 use crate::ui::style::{hint, plural, prompt};
 use std::fmt;
-use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -62,7 +67,7 @@ impl fmt::Display for AppError {
             AppError::NoTerminalToConfirm => f.write_str(
                 "Nothing was moved: there's no terminal to ask for confirmation (pass --yes to skip it)",
             ),
-            AppError::NotAllMoved(n) => write!(f, "{} item(s) could not be moved to the Trash", n),
+            AppError::NotAllMoved(n) => write!(f, "{} item(s) could not be moved", n),
             AppError::NoCopyInside(path) => write!(
                 f,
                 "no duplicate group has a copy inside '{}'; nothing was changed",
@@ -148,6 +153,16 @@ fn cache_file() -> Option<PathBuf> {
 
 /// Scans `root` and runs one command-line action on it.
 pub fn run_action(root: &Path, action: Action, options: &RunOptions) -> Result<(), AppError> {
+    // Organizing only reads the files directly in `root`, so it skips the scan
+    match action {
+        Action::Organize {
+            by,
+            apply,
+            assume_yes,
+        } => return handle_organize(root, by, apply, assume_yes),
+        Action::Undo { assume_yes } => return handle_undo(root, assume_yes),
+        _ => {}
+    }
     let files = scan(root, options).map_err(AppError::Scan)?;
 
     match action {
@@ -181,26 +196,12 @@ pub fn run_action(root: &Path, action: Action, options: &RunOptions) -> Result<(
             handle_artifacts(root, &files, options, days, all, mode)?
         }
         Action::Similar { file, threshold } => {
-            let target = locate_base_file(root, &file)?;
+            let target = similar::locate_base_file(root, &file)?;
             show_similar_documents(root, &target, &files, threshold)?;
         }
+        Action::Organize { .. } | Action::Undo { .. } => unreachable!("handled before the scan"),
     }
     Ok(())
-}
-
-/// Builds the `FileInfo` for the `--similar` base file. When the file lives
-/// inside `root`, its path is expressed the same way the scanner builds paths
-/// (root + relative part) so the comparison recognizes and skips it.
-fn locate_base_file(root: &Path, file: &str) -> Result<FileInfo, AppError> {
-    let path = resolve_user_path(file);
-    let metadata = match fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(source) => return Err(AppError::UnreadableFile { path, source }),
-    };
-    if !metadata.is_file() {
-        return Err(AppError::NotAFile(path));
-    }
-    Ok(FileInfo::from_metadata(in_scan_form(root, path), &metadata))
 }
 
 /// Prints the files matching an extension, or a notice when there are none.
@@ -313,23 +314,6 @@ pub fn handle_artifacts(
     } else {
         Err(AppError::NotAllMoved(report.skipped.len()))
     }
-}
-
-/// Compares `target` with the other documents and prints the matches.
-pub fn show_similar_documents(
-    root: &Path,
-    target: &FileInfo,
-    files: &[FileInfo],
-    threshold: f64,
-) -> Result<(), AppError> {
-    let matches = {
-        let spinner = Spinner::start("Reading documents", "documents");
-        find_similar_documents(target, files, threshold, &|done, total| {
-            spinner.update(done, total)
-        })?
-    };
-    print_similarity_results(root, target.name(), &matches, threshold);
-    Ok(())
 }
 
 /// What happens after the duplicate groups are shown.

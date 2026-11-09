@@ -117,6 +117,17 @@ fn test_usage_errors() {
         ". --old 30 --threshold 5",
         ". other",
         "--dupes",
+        ". --organize",
+        ". --organize color",
+        ". --organize type --trash",
+        ". --organize type --yes",
+        ". --dupes --apply",
+        ". --apply",
+        ". --organize type --dupes",
+        ". --undo --apply",
+        ". --undo --trash",
+        ". --undo --organize type",
+        "--undo",
     ] {
         assert!(parse(bad).is_err(), "expected a usage error for '{}'", bad);
     }
@@ -174,5 +185,44 @@ fn test_old_days_are_optional() {
                 exclude: vec!["Backups".into()],
             },
         })
+    );
+}
+
+#[test]
+fn test_organize_and_its_modifiers() {
+    use crate::core::organize::OrganizeBy;
+    let organize = |by, apply, assume_yes| {
+        run(
+            ".",
+            Some(Action::Organize {
+                by,
+                apply,
+                assume_yes,
+            }),
+        )
+    };
+    assert_eq!(
+        parse(". --organize year"),
+        organize(OrganizeBy::Year, false, false)
+    );
+    assert_eq!(
+        parse(". --organize size"),
+        organize(OrganizeBy::Size, false, false)
+    );
+    assert_eq!(
+        parse(". --organize words --apply"),
+        organize(OrganizeBy::Words, true, false)
+    );
+    assert_eq!(
+        parse("--apply -y . --organize type"),
+        organize(OrganizeBy::Type, true, true)
+    );
+    assert_eq!(
+        parse(". --undo"),
+        run(".", Some(Action::Undo { assume_yes: false }))
+    );
+    assert_eq!(
+        parse(". --undo --yes"),
+        run(".", Some(Action::Undo { assume_yes: true }))
     );
 }

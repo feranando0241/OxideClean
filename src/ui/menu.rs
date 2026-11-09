@@ -6,6 +6,7 @@ use crate::core::artifacts::DEFAULT_ARTIFACT_DAYS;
 use crate::core::files::{DEFAULT_TOP, get_top_largest, is_document};
 use crate::core::models::FileInfo;
 use crate::core::old_files::{DEFAULT_OLD_DAYS, days};
+use crate::core::organize::OrganizeBy;
 use crate::core::scanner::list_accessible_subdirectories;
 use crate::core::similarity::{DEFAULT_THRESHOLD, VERY_SIMILAR};
 use crate::ui::browser::run_directory_browser;
@@ -63,34 +64,43 @@ pub fn run_interactive() {
     }
 }
 
-/// Scans the folder, shows the summary and opens the action menu.
+/// Scans the folder, shows the summary and opens the action menu. Scans
+/// again when the menu reports that files were moved into new places.
 pub fn process_target_path(target_path: &Path, options: &RunOptions) {
-    hint(&format!("\nScanning {} …", target_path.display()));
+    loop {
+        hint(&format!("\nScanning {} …", target_path.display()));
 
-    match app::scan(target_path, options) {
-        Ok(files) if files.is_empty() => {
-            println!("No files found in {}.", target_path.display());
-            hint("Hidden folders and system/build folders (like node_modules) are skipped.");
-        }
-        Ok(files) => {
-            print_summary(target_path, &files);
-            run_action_menu(target_path, &files, options);
-        }
-        Err(err) => {
-            error(&format!("Could not scan the folder: {}", err));
+        match app::scan(target_path, options) {
+            Ok(files) if files.is_empty() => {
+                println!("No files found in {}.", target_path.display());
+                hint("Hidden folders and system/build folders (like node_modules) are skipped.");
+                return;
+            }
+            Ok(files) => {
+                print_summary(target_path, &files);
+                if !run_action_menu(target_path, &files, options) {
+                    return;
+                }
+            }
+            Err(err) => {
+                error(&format!("Could not scan the folder: {}", err));
+                return;
+            }
         }
     }
 }
 
 /// Displays and runs the action sub-menu for the currently scanned folder.
-fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions) {
+/// Returns true when files may have moved and the folder should be scanned
+/// again, false to choose another folder.
+fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions) -> bool {
     // Full menu the first time (or on '?'); a compact reminder afterwards
     let mut show_full_menu = true;
     loop {
         if !show_full_menu {
             hint("1 all files · 2 biggest · 3 by type · 4 folders · 5 identical copies");
             hint(
-                "6 same name · 7 similar docs · 8 untouched files · 9 build folders · ? full menu · 0 another folder",
+                "6 same name · 7 similar docs · 8 untouched files · 9 build folders · 10 organize · ? full menu · 0 another folder",
             );
         } else {
             show_full_menu = false;
@@ -105,6 +115,8 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
             println!("    6  Find files with the same name in different places");
             println!("    8  Find big files nobody has touched in months");
             println!("    9  Find build folders of projects you stopped working on");
+            hint("\n  Organize");
+            println!("    10 Sort the files in this folder into folders (or undo it)");
             hint("\n  Compare documents");
             println!("    7  Find documents with similar content");
             println!();
@@ -184,17 +196,54 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
                     println!();
                 }
             }
+            "10" => {
+                if run_organize_steps(target_path) {
+                    return true;
+                }
+            }
             "?" | "help" | "menu" => {
                 show_full_menu = true;
             }
             "0" | "exit" | "back" | "q" => {
-                break;
+                return false;
             }
             _ => {
-                error("That's not an option. Type a number from 0 to 9, or ? to see the menu.");
+                error("That's not an option. Type a number from 0 to 10, or ? to see the menu.");
             }
         }
     }
+}
+
+/// Asks how to organize (or to undo) and runs it. Shows the plan and asks
+/// before moving anything. True when it ran, so the folder is scanned again.
+fn run_organize_steps(target_path: &Path) -> bool {
+    println!("\nSort the files directly in this folder by what?");
+    println!("  year · size · type · words (project, tarea, cv, pdf…)");
+    hint("  Or type undo to put back what was sorted before. Enter to go back.");
+    prompt();
+    let answer = read_line_from_user().to_lowercase();
+    let result = match answer.as_str() {
+        "" => return false,
+        "undo" => app::handle_undo(target_path, false),
+        other => {
+            let by = match other {
+                "year" => OrganizeBy::Year,
+                "size" => OrganizeBy::Size,
+                "type" => OrganizeBy::Type,
+                "words" => OrganizeBy::Words,
+                _ => {
+                    error("Type year, size, type, words or undo.");
+                    return false;
+                }
+            };
+            app::handle_organize(target_path, by, true, false)
+        }
+    };
+    if let Err(err) = result {
+        error(&err.to_string());
+        println!();
+    }
+    true
 }
 
 /// Asks for a number of days (Enter takes `default`).
