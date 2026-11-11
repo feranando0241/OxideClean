@@ -5,6 +5,7 @@
 //! - `input`   reading lines, paths and group selections
 //! - `duplicates` choosing which duplicate groups to move and what to keep
 //! - `artifacts` the build folders screen
+//! - `screenshots` the screenshots screen
 //! - `organize` the plan and report for organizing files into folders
 //! - `menu`    start screen and action menu
 //! - `browser` folder browser
@@ -20,4 +21,5 @@ pub mod organize;
 pub mod picker;
 pub mod progress;
 pub mod report;
+pub mod screenshots;
 pub mod style;

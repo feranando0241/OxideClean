@@ -215,7 +215,7 @@ fn words_of(name: &str) -> Vec<String> {
 /// Removes Spanish accents in both forms a name can arrive in: precomposed
 /// ("ó") and decomposed ("o" + a combining accent, common in macOS names).
 /// Without this, a decomposed "solución" would split into "solucio" and "n".
-fn fold_accents(text: &str) -> String {
+pub(crate) fn fold_accents(text: &str) -> String {
     text.chars()
         .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
         .map(|c| match c {

@@ -16,6 +16,7 @@
 //! - `files`       simple queries: biggest, by type, same name, space used
 //! - `duplicates/` finding identical files, hashing, the hash cache and
 //!   moving extra copies to the Trash
+//! - `screenshots` screenshots left behind after pasting them (ADR-0008)
 //! - `similarity`  comparing documents by content
 
 pub mod artifact_trash;
@@ -27,6 +28,7 @@ pub mod old_files;
 pub mod organize;
 pub mod paths;
 pub mod scanner;
+pub mod screenshots;
 pub mod similarity;
 
 #[cfg(test)]

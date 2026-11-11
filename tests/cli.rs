@@ -648,3 +648,20 @@ fn undo_asks_puts_files_back_and_removes_the_log() {
     assert_eq!(state, (true, false, false));
     assert!(stdout(&again).contains("Nothing to undo"));
 }
+
+#[test]
+fn screenshots_lists_only_old_ones_and_moves_nothing() {
+    let dir = fixture("screenshots");
+    let shot = dir.join("Screenshot 2026-01-01 at 1.00.00 PM.png");
+    fs::write(&shot, vec![3u8; 5_000]).unwrap();
+    let out = run(&[path_str(&dir), "--screenshots"], "");
+    let trash = run(&[path_str(&dir), "--screenshots", "--trash"], "y\n");
+    let kept = shot.exists();
+    let _ = fs::remove_dir_all(&dir);
+    // Written moments ago: far from a day old, whatever its name says
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Screenshots older than 1 day"));
+    assert!(stdout(&out).contains("None found."));
+    assert!(trash.status.success(), "stderr: {}", stderr(&trash));
+    assert!(kept);
+}

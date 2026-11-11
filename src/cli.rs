@@ -7,6 +7,7 @@ use crate::core::artifacts::DEFAULT_ARTIFACT_DAYS;
 use crate::core::files::DEFAULT_TOP;
 use crate::core::old_files::{DEFAULT_OLD_DAYS, days};
 use crate::core::organize::OrganizeBy;
+use crate::core::screenshots::DEFAULT_SCREENSHOT_DAYS;
 use crate::core::similarity::DEFAULT_THRESHOLD;
 use std::iter::Peekable;
 
@@ -37,6 +38,11 @@ ACTIONS:
       --trash              ...and choose which to move to the Trash
       --yes, -y            ...move forgotten projects without asking, except those
                            with programs in target/release (not with --all)
+    --screenshots [DAYS]   Screenshots and screen recordings older than DAYS days
+                           (default 1), biggest first (read-only). Found by the
+                           mark macOS sets on them, or by their name
+      --trash              ...and choose which to move to the Trash
+      --yes, -y            ...move all of them without asking
     --organize <BY>        Plan moving the files directly in PATH into folders by
                            year, size, type or words (project, tarea, cv, pdf…).
                            Subfolders and hidden files are left alone (read-only)
@@ -92,6 +98,12 @@ pub enum Action {
     Similar {
         file: String,
         threshold: f64,
+    },
+    /// Screenshots older than `days`, optionally moved to the Trash.
+    Screenshots {
+        days: u64,
+        trash: bool,
+        assume_yes: bool,
     },
     /// Move the loose files of PATH into folders; with `apply: false`, only
     /// show where each would go.
@@ -186,6 +198,11 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
                 trash: false,
                 assume_yes: false,
             }),
+            "--screenshots" => Some(Action::Screenshots {
+                days: optional_days(&mut iter, "--screenshots", DEFAULT_SCREENSHOT_DAYS)?,
+                trash: false,
+                assume_yes: false,
+            }),
             "--organize" => {
                 let raw = take_value(&mut iter, "--organize")?;
                 let by = match raw.as_str() {
@@ -272,8 +289,11 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     // Attach modifiers to their action, rejecting them anywhere else
     let is_dupes = matches!(action, Some(Action::Dupes { .. }));
     let is_artifacts = matches!(action, Some(Action::Artifacts { .. }));
-    if trash && !is_dupes && !is_artifacts {
-        return Err("--trash can only be used with --dupes or --artifacts".to_string());
+    let is_screenshots = matches!(action, Some(Action::Screenshots { .. }));
+    if trash && !is_dupes && !is_artifacts && !is_screenshots {
+        return Err(
+            "--trash can only be used with --dupes, --artifacts or --screenshots".to_string(),
+        );
     }
     if keep_in.is_some() && !is_dupes {
         return Err("--keep-in can only be used with --dupes".to_string());
@@ -313,6 +333,11 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         Some(Action::Organize { by, .. }) => Some(Action::Organize {
             by,
             apply,
+            assume_yes,
+        }),
+        Some(Action::Screenshots { days, .. }) => Some(Action::Screenshots {
+            days,
+            trash,
             assume_yes,
         }),
         Some(Action::Undo { .. }) => Some(Action::Undo { assume_yes }),

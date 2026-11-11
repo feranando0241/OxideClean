@@ -7,3 +7,8 @@ edition = "2024"
 trash = "5.2.9"
 sha2 = "0.11"
 pdf-extract = "0.12"
+
+# Only to read the screenshot mark macOS sets on files (getxattr). Already
+# built for sha2, so it adds no new crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

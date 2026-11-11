@@ -125,6 +125,11 @@ fn test_usage_errors() {
         ". --apply",
         ". --organize type --dupes",
         ". --undo --apply",
+        ". --screenshots 0",
+        ". --screenshots -y",
+        ". --screenshots --apply",
+        ". --screenshots --all",
+        ". --screenshots --keep-in Photos",
         ". --undo --trash",
         ". --undo --organize type",
         "--undo",
@@ -224,5 +229,26 @@ fn test_organize_and_its_modifiers() {
     assert_eq!(
         parse(". --undo --yes"),
         run(".", Some(Action::Undo { assume_yes: true }))
+    );
+}
+
+#[test]
+fn test_screenshots_and_its_modifiers() {
+    let shots = |days, trash, assume_yes| {
+        run(
+            ".",
+            Some(Action::Screenshots {
+                days,
+                trash,
+                assume_yes,
+            }),
+        )
+    };
+    assert_eq!(parse(". --screenshots"), shots(1, false, false));
+    assert_eq!(parse(". --screenshots 7"), shots(7, false, false));
+    assert_eq!(parse(". --screenshots --trash"), shots(1, true, false));
+    assert_eq!(
+        parse(". --screenshots 30 --trash -y"),
+        shots(30, true, true)
     );
 }

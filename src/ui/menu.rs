@@ -1,6 +1,6 @@
 //! Interactive mode: the start screen and the action menu after a scan.
 
-use crate::app::{self, ArtifactsMode, DupesMode};
+use crate::app::{self, ArtifactsMode, DupesMode, ScreenshotsMode};
 use crate::cli::RunOptions;
 use crate::core::artifacts::DEFAULT_ARTIFACT_DAYS;
 use crate::core::files::{DEFAULT_TOP, get_top_largest, is_document};
@@ -8,6 +8,7 @@ use crate::core::models::FileInfo;
 use crate::core::old_files::{DEFAULT_OLD_DAYS, days};
 use crate::core::organize::OrganizeBy;
 use crate::core::scanner::list_accessible_subdirectories;
+use crate::core::screenshots::DEFAULT_SCREENSHOT_DAYS;
 use crate::core::similarity::{DEFAULT_THRESHOLD, VERY_SIMILAR};
 use crate::ui::browser::run_directory_browser;
 use crate::ui::input::{is_exit_command, is_one_of, read_line_from_user, resolve_user_path};
@@ -100,7 +101,7 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
         if !show_full_menu {
             hint("1 all files · 2 biggest · 3 by type · 4 folders · 5 identical copies");
             hint(
-                "6 same name · 7 similar docs · 8 untouched files · 9 build folders · 10 organize · ? full menu · 0 another folder",
+                "6 same name · 7 similar docs · 8 untouched files · 9 build folders · 10 organize · 11 screenshots · ? full menu · 0 another folder",
             );
         } else {
             show_full_menu = false;
@@ -115,6 +116,7 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
             println!("    6  Find files with the same name in different places");
             println!("    8  Find big files nobody has touched in months");
             println!("    9  Find build folders of projects you stopped working on");
+            println!("    11 Find old screenshots you only took to paste");
             hint("\n  Organize");
             println!("    10 Sort the files in this folder into folders (or undo it)");
             hint("\n  Compare documents");
@@ -201,6 +203,15 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
                     return true;
                 }
             }
+            "11" => {
+                if let Some(n) = ask_days(DEFAULT_SCREENSHOT_DAYS)
+                    && let Err(err) =
+                        app::handle_screenshots(target_path, files, n, ScreenshotsMode::Choose)
+                {
+                    error(&err.to_string());
+                    println!();
+                }
+            }
             "?" | "help" | "menu" => {
                 show_full_menu = true;
             }
@@ -208,7 +219,7 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
                 return false;
             }
             _ => {
-                error("That's not an option. Type a number from 0 to 10, or ? to see the menu.");
+                error("That's not an option. Type a number from 0 to 11, or ? to see the menu.");
             }
         }
     }

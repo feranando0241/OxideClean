@@ -4,9 +4,11 @@
 //! lives here, in one place.
 
 mod organize;
+mod screenshots;
 mod similar;
 
 pub use organize::{handle_organize, handle_undo};
+pub use screenshots::{ScreenshotsMode, handle_screenshots};
 pub use similar::show_similar_documents;
 
 use crate::cli::{Action, RunOptions};
@@ -198,6 +200,18 @@ pub fn run_action(root: &Path, action: Action, options: &RunOptions) -> Result<(
         Action::Similar { file, threshold } => {
             let target = similar::locate_base_file(root, &file)?;
             show_similar_documents(root, &target, &files, threshold)?;
+        }
+        Action::Screenshots {
+            days,
+            trash,
+            assume_yes,
+        } => {
+            let mode = match (trash, assume_yes) {
+                (false, _) => ScreenshotsMode::ListOnly,
+                (true, false) => ScreenshotsMode::Choose,
+                (true, true) => ScreenshotsMode::MoveAll,
+            };
+            handle_screenshots(root, &files, days, mode)?
         }
         Action::Organize { .. } | Action::Undo { .. } => unreachable!("handled before the scan"),
     }
