@@ -380,6 +380,45 @@ cargo test
 
 ---
 
+## What I learned building it
+
+This project started on 2026-09-24 as one 583-line `main.rs` with four tests. These are the things that changed how I work, each with where it shows in the repo.
+
+| | First commit (`f142952`) | Now |
+|---|---|---|
+| Rust code | 1,550 lines in 6 files | ~10,100 lines in 54 files |
+| Tests | 4 | 137, including property and end-to-end tests |
+| Recorded decisions | none | 7 ADRs in `docs/adr/` |
+| Moving files to the Trash | the first file found was kept, the first error stopped everything, nothing was checked again | listed first, confirmed, re-checked on disk right before acting, every skip explained |
+
+**Plan before writing code.** Before each feature I now list what already exists that I can reuse and what can go wrong. `--organize` started as a list of fifteen failure scenarios, and most of them became tests.
+
+**Write the tests before changing the structure.** The end-to-end tests (`3de8a87`) came before splitting the code into layers (`d6df3f4`), so the refactor could prove it changed nothing.
+
+**Keep the logic apart from what's shown on screen.** The instinct was there from the first commit: the scanner and the duplicate finder never printed anything, and the screens lived in their own file. But it wasn't a rule yet: `main.rs` grew to 763 lines mixing menus with the code that decides what gets deleted, and the similarity engine printed from inside its own logic. On 2026-10-20 I split everything into `core` (logic only, never prints or reads input), `ui` (everything shown or typed) and `app` (the actions shared by the command line and the menus), and wrote it down in [ADR-0002](docs/adr/0002-modular-architecture.md). I made that choice assuming the project would grow, and it paid off with every feature since. Each one reports through data and typed errors, so the same logic serves the command line and the menus, it's tested without a terminal, and a graphical interface can be added later without touching the code that moves files.
+
+**Rules only hold if something checks them.** "Core never prints" and "no file over 500 lines" are tests in `tests/architecture.rs`. They forced me to split `app.rs` and `organize.rs` at the moment it was needed, not "someday".
+
+**Look at the real data before assuming.** macOS puts an invisible narrow no-break space (U+202F) in screenshot names, and marks every screenshot with an extended attribute. I only found out by reading my own files byte by byte.
+
+**Fix the cause, not the symptom.** Screenshots I only took to paste were piling up. The real fix was a keyboard shortcut that copies without saving; the `--screenshots` feature only cleans up what's already there.
+
+**Protecting is harder than destroying.** Deleting needs one rule. Not deleting by mistake needed me to learn that `fs::rename` silently overwrites, that `Photo.jpg` and `photo.jpg` are the same file on macOS, and that a fresh download can carry an old date (only the ctime tells the truth).
+
+**When in doubt, don't touch it.** Every rule can only take files *off* a list. The tool would rather miss something than act on the wrong file: closed lists, a second check on disk, and a way back (the Trash or `--undo`).
+
+**The knowledge that protects can also target.** Finding build folders safely means knowing where projects are and which are in use, and that same map could aim at them. So every important safeguard has a test that fails if someone loosens it, and the step that acts never trusts the step that detected.
+
+**Match the care to what can't be undone.** A plan or a listing can be quick. Moving or deleting someone's files gets every check.
+
+**Write down what I rejected, and why.** The ADRs record the options I turned down: renaming on collision, entering subfolders, an extra dependency for one yes/no question. Those are the decisions I'd otherwise relitigate.
+
+**What I enjoy is thinking things through.** The best moments of this project weren't when something compiled. They were finding out that `fs::rename` overwrites, seeing that the same code that protects projects could target them, and asking what happens if someone loosens a rule. I like programming most when it makes me think about what could go wrong and why a decision is the right one.
+
+**How it was built.** I worked with an AI assistant as a pair programmer: it wrote much of the code with me. The questions, the decisions, and the review and testing of every part were mine, and the ADRs show the reasoning behind each choice.
+
+---
+
 ## License
 
 This project is open source and available under the MIT License.
