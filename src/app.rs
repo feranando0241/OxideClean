@@ -3,7 +3,16 @@
 //! same in both modes (especially the rules for moving files to the Trash)
 //! lives here, in one place.
 
+mod organize;
+mod screenshots;
+mod similar;
+
+pub use organize::{handle_organize, handle_undo};
+pub use screenshots::{ScreenshotsMode, handle_screenshots};
+pub use similar::show_similar_documents;
+
 use crate::cli::{Action, RunOptions};
+use crate::core::artifact_trash::trash_artifacts;
 use crate::core::artifacts::find_artifacts;
 use crate::core::duplicates::hash_cache::HashCache;
 use crate::core::duplicates::trash::trash_duplicates;
@@ -11,20 +20,19 @@ use crate::core::duplicates::{DuplicateGroup, find_exact_duplicates, keep_copies
 use crate::core::files::{filter_by_extension, find_same_name_files, get_top_largest};
 use crate::core::models::FileInfo;
 use crate::core::old_files::{days, find_old_files};
-use crate::core::paths::{folder_in_scan, in_scan_form};
+use crate::core::paths::folder_in_scan;
 use crate::core::scanner::scan_directory;
-use crate::core::similarity::{SimilarityError, find_similar_documents};
-use crate::ui::artifacts::print_artifacts;
+use crate::core::similarity::SimilarityError;
+use crate::ui::artifacts::{choose_artifacts, print_artifact_trash_report, print_artifacts};
 use crate::ui::duplicates::choose_groups_to_trash;
 use crate::ui::input::{read_line_from_user, resolve_user_path};
 use crate::ui::progress::Spinner;
 use crate::ui::report::{
     print_exact_duplicates, print_filtered_files, print_old_files, print_same_name_results,
-    print_similarity_results, print_top_largest, print_trash_report,
+    print_top_largest, print_trash_report,
 };
 use crate::ui::style::{hint, plural, prompt};
 use std::fmt;
-use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -61,7 +69,7 @@ impl fmt::Display for AppError {
             AppError::NoTerminalToConfirm => f.write_str(
                 "Nothing was moved: there's no terminal to ask for confirmation (pass --yes to skip it)",
             ),
-            AppError::NotAllMoved(n) => write!(f, "{} file(s) could not be moved to the Trash", n),
+            AppError::NotAllMoved(n) => write!(f, "{} item(s) could not be moved", n),
             AppError::NoCopyInside(path) => write!(
                 f,
                 "no duplicate group has a copy inside '{}'; nothing was changed",
@@ -147,6 +155,16 @@ fn cache_file() -> Option<PathBuf> {
 
 /// Scans `root` and runs one command-line action on it.
 pub fn run_action(root: &Path, action: Action, options: &RunOptions) -> Result<(), AppError> {
+    // Organizing only reads the files directly in `root`, so it skips the scan
+    match action {
+        Action::Organize {
+            by,
+            apply,
+            assume_yes,
+        } => return handle_organize(root, by, apply, assume_yes),
+        Action::Undo { assume_yes } => return handle_undo(root, assume_yes),
+        _ => {}
+    }
     let files = scan(root, options).map_err(AppError::Scan)?;
 
     match action {
@@ -166,28 +184,38 @@ pub fn run_action(root: &Path, action: Action, options: &RunOptions) -> Result<(
         }
         Action::SameName => show_same_name_files(root, &files),
         Action::Old(n) => show_old_files(root, &files, n),
-        Action::Artifacts { days, all } => show_artifacts(root, &files, options, days, all),
+        Action::Artifacts {
+            days,
+            all,
+            trash,
+            assume_yes,
+        } => {
+            let mode = match (trash, assume_yes) {
+                (false, _) => ArtifactsMode::ListOnly,
+                (true, false) => ArtifactsMode::Choose,
+                (true, true) => ArtifactsMode::MoveClearCut,
+            };
+            handle_artifacts(root, &files, options, days, all, mode)?
+        }
         Action::Similar { file, threshold } => {
-            let target = locate_base_file(root, &file)?;
+            let target = similar::locate_base_file(root, &file)?;
             show_similar_documents(root, &target, &files, threshold)?;
         }
+        Action::Screenshots {
+            days,
+            trash,
+            assume_yes,
+        } => {
+            let mode = match (trash, assume_yes) {
+                (false, _) => ScreenshotsMode::ListOnly,
+                (true, false) => ScreenshotsMode::Choose,
+                (true, true) => ScreenshotsMode::MoveAll,
+            };
+            handle_screenshots(root, &files, days, mode)?
+        }
+        Action::Organize { .. } | Action::Undo { .. } => unreachable!("handled before the scan"),
     }
     Ok(())
-}
-
-/// Builds the `FileInfo` for the `--similar` base file. When the file lives
-/// inside `root`, its path is expressed the same way the scanner builds paths
-/// (root + relative part) so the comparison recognizes and skips it.
-fn locate_base_file(root: &Path, file: &str) -> Result<FileInfo, AppError> {
-    let path = resolve_user_path(file);
-    let metadata = match fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(source) => return Err(AppError::UnreadableFile { path, source }),
-    };
-    if !metadata.is_file() {
-        return Err(AppError::NotAFile(path));
-    }
-    Ok(FileInfo::from_metadata(in_scan_form(root, path), &metadata))
 }
 
 /// Prints the files matching an extension, or a notice when there are none.
@@ -223,10 +251,28 @@ pub fn show_old_files(root: &Path, files: &[FileInfo], n: u64) {
     print_old_files(root, &find_old_files(files, now, threshold), n);
 }
 
-/// Prints the build folders of projects untouched for more than `n` days (see
-/// ADR-0005), or of every project with `all`. `n` must be a valid threshold,
-/// like in `show_old_files`.
-pub fn show_artifacts(root: &Path, files: &[FileInfo], options: &RunOptions, n: u64, all: bool) {
+/// What happens after the build folders are shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactsMode {
+    /// Only list them (`--artifacts`).
+    ListOnly,
+    /// Let the user pick which to move (`--trash`, the menu).
+    Choose,
+    /// Move the clear-cut ones without asking (`--trash --yes`).
+    MoveClearCut,
+}
+
+/// Shows the build folders of projects untouched for more than `n` days (see
+/// ADR-0005), or of every project with `all`, and acts according to `mode`.
+/// `n` must be a valid threshold, like in `show_old_files`.
+pub fn handle_artifacts(
+    root: &Path,
+    files: &[FileInfo],
+    options: &RunOptions,
+    n: u64,
+    all: bool,
+    mode: ArtifactsMode,
+) -> Result<(), AppError> {
     let threshold = days(n).expect("the caller checked the number of days");
     let excluded: Vec<PathBuf> = options
         .exclude
@@ -234,7 +280,7 @@ pub fn show_artifacts(root: &Path, files: &[FileInfo], options: &RunOptions, n: 
         .map(|folder| folder_in_scan(root, &resolve_user_path(folder)))
         .collect();
     let now = SystemTime::now();
-    let report = {
+    let found = {
         let spinner = Spinner::start("Measuring build folders", "folders");
         find_artifacts(
             files,
@@ -246,24 +292,42 @@ pub fn show_artifacts(root: &Path, files: &[FileInfo], options: &RunOptions, n: 
             &|done, total| spinner.update(done, total),
         )
     };
-    print_artifacts(root, &report, n, all);
-}
+    print_artifacts(root, &found, n, all, mode == ArtifactsMode::ListOnly);
 
-/// Compares `target` with the other documents and prints the matches.
-pub fn show_similar_documents(
-    root: &Path,
-    target: &FileInfo,
-    files: &[FileInfo],
-    threshold: f64,
-) -> Result<(), AppError> {
-    let matches = {
-        let spinner = Spinner::start("Reading documents", "documents");
-        find_similar_documents(target, files, threshold, &|done, total| {
-            spinner.update(done, total)
-        })?
+    let selected = match mode {
+        ArtifactsMode::ListOnly => return Ok(()),
+        ArtifactsMode::MoveClearCut => found
+            .found
+            .iter()
+            .filter(|a| a.moves_unattended())
+            .cloned()
+            .collect(),
+        ArtifactsMode::Choose => {
+            if !found.found.iter().any(|a| a.can_move()) {
+                return Ok(());
+            }
+            require_terminal()?;
+            choose_artifacts(&found).unwrap_or_default()
+        }
     };
-    print_similarity_results(root, target.name(), &matches, threshold);
-    Ok(())
+    if selected.is_empty() {
+        println!("Nothing was moved.\n");
+        return Ok(());
+    }
+
+    let report = {
+        let spinner = Spinner::start("Re-checking build folders before moving them", "folders");
+        // A fresh clock: the user may have taken a while to choose
+        trash_artifacts(&selected, SystemTime::now(), threshold, &|done, total| {
+            spinner.update(done, total)
+        })
+    };
+    print_artifact_trash_report(root, &report);
+    if report.skipped.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::NotAllMoved(report.skipped.len()))
+    }
 }
 
 /// What happens after the duplicate groups are shown.

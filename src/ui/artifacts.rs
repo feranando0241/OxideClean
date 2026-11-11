@@ -1,8 +1,12 @@
-//! The screen for build artifacts in forgotten projects (see ADR-0005).
+//! The screens for build folders (see ADR-0005): the list, choosing which to
+//! move to the Trash, and what happened.
 
-use crate::core::artifacts::{ArtifactKind, Artifacts, Confidence, ProjectState};
+use crate::core::artifact_trash::{ArtifactSkip, ArtifactTrashReport};
+use crate::core::artifacts::{Artifact, ArtifactKind, Artifacts, Confidence, ProjectState};
+use crate::ui::input::{parse_selection, read_line_from_user};
 use crate::ui::style::{
-    bold, dim, format_age, format_size, header, hint, plural, relative, rule, truncate, yellow,
+    bold, dim, error, format_age, format_size, header, hint, plural, prompt, relative, rule,
+    truncate, yellow,
 };
 use std::path::Path;
 
@@ -10,7 +14,7 @@ use std::path::Path;
 const PROJECT_W: usize = 34;
 
 /// Displays the artifacts found, how to rebuild them, and what was left alone.
-pub fn print_artifacts(root: &Path, report: &Artifacts, days: u64, all: bool) {
+pub fn print_artifacts(root: &Path, report: &Artifacts, days: u64, all: bool, listing_only: bool) {
     if all {
         header("Build folders in every project");
     } else {
@@ -26,7 +30,8 @@ pub fn print_artifacts(root: &Path, report: &Artifacts, days: u64, all: bool) {
         println!(
             "\n{}",
             dim(&format!(
-                "{:<PROJECT_W$} {:<6} {:>10}  {:>10}  {}{}",
+                "{:<4} {:<PROJECT_W$} {:<6} {:>10}  {:>10}  {}{}",
+                "#",
                 "PROJECT",
                 "TYPE",
                 "SIZE",
@@ -35,7 +40,15 @@ pub fn print_artifacts(root: &Path, report: &Artifacts, days: u64, all: bool) {
                 "REBUILD WITH"
             ))
         );
+        // Numbered as `choose_artifacts` reads them: only what can be moved
+        let mut number = 0;
         for artifact in &report.found {
+            let label = if artifact.can_move() {
+                number += 1;
+                number.to_string()
+            } else {
+                "-".to_string()
+            };
             let kind = match artifact.kind {
                 ArtifactKind::Rust => "Rust",
                 ArtifactKind::Node => "Node",
@@ -53,14 +66,20 @@ pub fn print_artifacts(root: &Path, report: &Artifacts, days: u64, all: bool) {
                 (true, ProjectState::NotJudged) => "unknown    ",
             };
             println!(
-                "{:<PROJECT_W$} {:<6} {}  {:>10}  {}{}{}",
+                "{:<4} {:<PROJECT_W$} {:<6} {}  {:>10}  {}{}{}{}",
+                label,
                 truncate(&relative(&artifact.project, root), PROJECT_W),
                 kind,
                 bold(&format!("{:>10}", format_size(artifact.size.bytes))),
                 artifact.untouched.map_or("?".to_string(), format_age),
                 state,
                 dim(artifact.rebuild.unwrap_or("nothing records the packages")),
-                warning
+                warning,
+                if artifact.built_programs > 0 {
+                    " (bin)"
+                } else {
+                    ""
+                }
             );
         }
 
@@ -95,6 +114,12 @@ pub fn print_artifacts(root: &Path, report: &Artifacts, days: u64, all: bool) {
     {
         hint("(!) No exact record of versions: a rebuild may not give the same result.");
     }
+    if report.found.iter().any(|a| !a.can_move()) {
+        hint("- Can't be moved to the Trash: a rebuild can't be relied on.");
+    }
+    if report.found.iter().any(|a| a.built_programs > 0) {
+        hint("(bin) target/release holds programs: only cargo build --release brings them back.");
+    }
     if report.found.iter().any(|a| a.unreadable > 0) {
         hint("Some folders couldn't be read completely, so their real size may be larger.");
     }
@@ -124,6 +149,97 @@ pub fn print_artifacts(root: &Path, report: &Artifacts, days: u64, all: bool) {
     if !report.found.is_empty() {
         hint("Rebuilding can fail on old projects if a package or tool has moved on.");
     }
-    hint("Nothing was moved or changed.");
+    if listing_only {
+        hint("Nothing was moved or changed.");
+    }
+    println!();
+}
+
+/// Asks which build folders to move. Returns them, or `None` to leave
+/// everything as it is. Anything not clear-cut has to be picked by number and
+/// confirmed, so a quick `y` can't reach an active project.
+pub fn choose_artifacts(report: &Artifacts) -> Option<Vec<Artifact>> {
+    let movable: Vec<&Artifact> = report.found.iter().filter(|a| a.can_move()).collect();
+    let clear_cut: Vec<Artifact> = report
+        .found
+        .iter()
+        .filter(|a| a.moves_unattended())
+        .cloned()
+        .collect();
+    loop {
+        println!("\n{}", bold("What would you like to do?"));
+        if !clear_cut.is_empty() {
+            println!(
+                "  • Type y        to move the {} from forgotten projects",
+                plural(clear_cut.len(), "folder", "folders")
+            );
+        }
+        println!("  • Type numbers  to move only those (e.g. 1,3,5-7)");
+        println!("  • Press Enter   to leave everything as it is");
+        hint("  Moved folders can be restored from the Trash. Space comes back when you empty it.");
+        prompt();
+
+        let answer = read_line_from_user();
+        if answer.is_empty() {
+            return None;
+        }
+        if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+            if clear_cut.is_empty() {
+                error("Nothing can move without being chosen. Type numbers, or press Enter.");
+                continue;
+            }
+            return Some(clear_cut.clone());
+        }
+        match parse_selection(&answer, movable.len()) {
+            Ok(indices) => {
+                let selected: Vec<Artifact> = indices.iter().map(|&i| movable[i].clone()).collect();
+                return confirm_if_delicate(selected);
+            }
+            Err(message) => error(&format!("{} Or press Enter to leave them.", message)),
+        }
+    }
+}
+
+/// Asks once more if a selection includes something not clear-cut.
+fn confirm_if_delicate(selected: Vec<Artifact>) -> Option<Vec<Artifact>> {
+    let delicate = selected.iter().filter(|a| !a.moves_unattended()).count();
+    if delicate == 0 {
+        return Some(selected);
+    }
+    println!(
+        "\n{} active, or holding programs in target/release.",
+        plural(delicate, "folder is", "folders are")
+    );
+    println!("A build or server running there can break. Type yes to move them anyway.");
+    prompt();
+    read_line_from_user()
+        .eq_ignore_ascii_case("yes")
+        .then_some(selected)
+}
+
+/// Displays what happened when moving build folders to the Trash.
+pub fn print_artifact_trash_report(root: &Path, report: &ArtifactTrashReport) {
+    println!(
+        "\n{} moved to the Trash · {} will come back when you empty it",
+        bold(&plural(report.moved, "build folder", "build folders")),
+        bold(&format_size(report.moved_bytes))
+    );
+    if report.moved > 0 {
+        hint("Changed your mind? You can restore them from the Trash.");
+    }
+    for (path, skip) in &report.skipped {
+        let reason = match skip {
+            ArtifactSkip::NotMovable => "a rebuild can't be relied on".to_string(),
+            ArtifactSkip::NoLongerABuildFolder => {
+                "it no longer looks like a build folder".to_string()
+            }
+            ArtifactSkip::ProjectInUse => "the project has been used since the list".to_string(),
+            ArtifactSkip::RecentlyChanged => {
+                "it changed moments ago, maybe a build is running".to_string()
+            }
+            ArtifactSkip::CouldNotMove(message) => format!("the system refused: {}", message),
+        };
+        println!("  {}: {}", relative(path, root), reason);
+    }
     println!();
 }

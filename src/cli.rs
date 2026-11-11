@@ -6,6 +6,8 @@
 use crate::core::artifacts::DEFAULT_ARTIFACT_DAYS;
 use crate::core::files::DEFAULT_TOP;
 use crate::core::old_files::{DEFAULT_OLD_DAYS, days};
+use crate::core::organize::OrganizeBy;
+use crate::core::screenshots::DEFAULT_SCREENSHOT_DAYS;
 use crate::core::similarity::DEFAULT_THRESHOLD;
 use std::iter::Peekable;
 
@@ -33,6 +35,23 @@ ACTIONS:
                            in projects untouched for DAYS days (default 90), with
                            how to rebuild them (read-only)
       --all                ...in every project, marking the active ones
+      --trash              ...and choose which to move to the Trash
+      --yes, -y            ...move forgotten projects without asking, except those
+                           with programs in target/release (not with --all)
+    --screenshots [DAYS]   Screenshots and screen recordings older than DAYS days
+                           (default 1), biggest first (read-only). Found by the
+                           mark macOS sets on them, or by their name
+      --trash              ...and choose which to move to the Trash
+      --yes, -y            ...move all of them without asking
+    --organize <BY>        Plan moving the files directly in PATH into folders by
+                           year, size, type or words (project, tarea, cv, pdf…).
+                           Subfolders and hidden files are left alone (read-only)
+      --apply              ...and move them (asks first). Nothing is overwritten,
+                           and each move is logged in PATH/.oxide_clean_organize.tsv
+      --yes, -y            ...without asking
+    --undo                 Put back every file --organize --apply moved in PATH,
+                           newest first, never overwriting (asks first)
+      --yes, -y            ...without asking
     --similar <FILE>       Documents with content similar to FILE
       --threshold <N>      Minimum similarity percentage (default 30)
 
@@ -73,10 +92,29 @@ pub enum Action {
     Artifacts {
         days: u64,
         all: bool,
+        trash: bool,
+        assume_yes: bool,
     },
     Similar {
         file: String,
         threshold: f64,
+    },
+    /// Screenshots older than `days`, optionally moved to the Trash.
+    Screenshots {
+        days: u64,
+        trash: bool,
+        assume_yes: bool,
+    },
+    /// Move the loose files of PATH into folders; with `apply: false`, only
+    /// show where each would go.
+    Organize {
+        by: OrganizeBy,
+        apply: bool,
+        assume_yes: bool,
+    },
+    /// Put back what `Organize` moved, from the log in PATH.
+    Undo {
+        assume_yes: bool,
     },
 }
 
@@ -128,6 +166,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut keep_in: Option<String> = None;
     let mut threshold: Option<f64> = None;
     let mut all = false;
+    let mut apply = false;
 
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
@@ -156,7 +195,39 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             "--artifacts" => Some(Action::Artifacts {
                 days: optional_days(&mut iter, "--artifacts", DEFAULT_ARTIFACT_DAYS)?,
                 all: false,
+                trash: false,
+                assume_yes: false,
             }),
+            "--screenshots" => Some(Action::Screenshots {
+                days: optional_days(&mut iter, "--screenshots", DEFAULT_SCREENSHOT_DAYS)?,
+                trash: false,
+                assume_yes: false,
+            }),
+            "--organize" => {
+                let raw = take_value(&mut iter, "--organize")?;
+                let by = match raw.as_str() {
+                    "year" => OrganizeBy::Year,
+                    "size" => OrganizeBy::Size,
+                    "type" => OrganizeBy::Type,
+                    "words" => OrganizeBy::Words,
+                    _ => {
+                        return Err(format!(
+                            "--organize must be year, size, type or words, got '{}'",
+                            raw
+                        ));
+                    }
+                };
+                Some(Action::Organize {
+                    by,
+                    apply: false,
+                    assume_yes: false,
+                })
+            }
+            "--undo" => Some(Action::Undo { assume_yes: false }),
+            "--apply" => {
+                apply = true;
+                None
+            }
             "--all" => {
                 all = true;
                 None
@@ -217,14 +288,25 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
 
     // Attach modifiers to their action, rejecting them anywhere else
     let is_dupes = matches!(action, Some(Action::Dupes { .. }));
-    if trash && !is_dupes {
-        return Err("--trash can only be used with --dupes".to_string());
+    let is_artifacts = matches!(action, Some(Action::Artifacts { .. }));
+    let is_screenshots = matches!(action, Some(Action::Screenshots { .. }));
+    if trash && !is_dupes && !is_artifacts && !is_screenshots {
+        return Err(
+            "--trash can only be used with --dupes, --artifacts or --screenshots".to_string(),
+        );
     }
     if keep_in.is_some() && !is_dupes {
         return Err("--keep-in can only be used with --dupes".to_string());
     }
-    if assume_yes && !trash {
-        return Err("--yes can only be used with --dupes --trash".to_string());
+    if apply && !matches!(action, Some(Action::Organize { .. })) {
+        return Err("--apply can only be used with --organize".to_string());
+    }
+    let is_undo = matches!(action, Some(Action::Undo { .. }));
+    if assume_yes && !trash && !apply && !is_undo {
+        return Err("--yes can only be used with --trash, --apply or --undo".to_string());
+    }
+    if all && assume_yes {
+        return Err("--yes can't be used with --all: active projects must be chosen".to_string());
     }
     if all && !matches!(action, Some(Action::Artifacts { .. })) {
         return Err("--all can only be used with --artifacts".to_string());
@@ -242,7 +324,23 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             file,
             threshold: threshold.unwrap_or(DEFAULT_THRESHOLD),
         }),
-        Some(Action::Artifacts { days, .. }) => Some(Action::Artifacts { days, all }),
+        Some(Action::Artifacts { days, .. }) => Some(Action::Artifacts {
+            days,
+            all,
+            trash,
+            assume_yes,
+        }),
+        Some(Action::Organize { by, .. }) => Some(Action::Organize {
+            by,
+            apply,
+            assume_yes,
+        }),
+        Some(Action::Screenshots { days, .. }) => Some(Action::Screenshots {
+            days,
+            trash,
+            assume_yes,
+        }),
+        Some(Action::Undo { .. }) => Some(Action::Undo { assume_yes }),
         other => other,
     };
 

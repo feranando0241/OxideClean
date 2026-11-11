@@ -423,6 +423,33 @@ fn artifacts_all_lists_active_projects_without_touching_them() {
     assert!(still_there, "--artifacts --all is read-only");
 }
 
+#[test]
+fn artifacts_yes_never_moves_an_active_project() {
+    let dir = fixture("artifacts_yes");
+    fs::write(dir.join("package.json"), "{}").unwrap();
+    fs::write(dir.join("package-lock.json"), "{}").unwrap();
+    fs::create_dir(dir.join("node_modules")).unwrap();
+    fs::write(dir.join("node_modules/a.js"), "x").unwrap();
+
+    let yes = run(&[path_str(&dir), "--artifacts", "--trash", "--yes"], "");
+    let all_yes = run(
+        &[path_str(&dir), "--artifacts", "--all", "--trash", "-y"],
+        "",
+    );
+    // Choosing needs someone to ask
+    let no_terminal = run(&[path_str(&dir), "--artifacts", "--all", "--trash"], "");
+    let still_there = dir.join("node_modules/a.js").exists();
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(yes.status.code(), Some(0));
+    assert!(stdout(&yes).contains("Nothing was moved."));
+    assert_eq!(all_yes.status.code(), Some(2));
+    assert!(stderr(&all_yes).contains("--yes can't be used with --all"));
+    assert_eq!(no_terminal.status.code(), Some(1));
+    assert!(stderr(&no_terminal).contains("no terminal to ask"));
+    assert!(still_there);
+}
+
 /// Runs a program in `dir`, failing the test if it doesn't work, and returns
 /// what it printed.
 fn run_in(dir: &Path, program: &str, args: &[&str]) -> String {
@@ -570,4 +597,71 @@ fn interactive_end_of_input_exits() {
     let out = run(&[path_str(&dir)], "");
     fs::remove_dir_all(&dir).unwrap();
     assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn organize_plans_without_moving_and_protects_fresh_files() {
+    let dir = fixture("organize_plan");
+    let out = run(&[path_str(&dir), "--organize", "type", "--apply"], "");
+    let text = stdout(&out);
+    let kept = dir.join("notes.md").exists();
+    let _ = fs::remove_dir_all(&dir);
+    // notes.md was written moments ago, so it may still be in use
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(text.contains("Nothing to organize here."), "{}", text);
+    assert!(
+        text.contains("notes.md: it changed moments ago"),
+        "{}",
+        text
+    );
+    assert!(kept);
+}
+
+#[test]
+fn undo_asks_puts_files_back_and_removes_the_log() {
+    let dir = fixture("organize_undo");
+    let log = dir.join(".oxide_clean_organize.tsv");
+    fs::create_dir(dir.join("Documents")).unwrap();
+    fs::rename(dir.join("notes.md"), dir.join("Documents/notes.md")).unwrap();
+    fs::write(&log, "notes.md\tDocuments/notes.md\n").unwrap();
+
+    // No terminal to ask on: nothing moves
+    let refused = run(&[path_str(&dir), "--undo"], "y\n");
+    let still_moved = dir.join("Documents/notes.md").exists();
+    let done = run(&[path_str(&dir), "--undo", "--yes"], "");
+    let state = (
+        dir.join("notes.md").exists(),
+        dir.join("Documents").exists(),
+        log.exists(),
+    );
+    let again = run(&[path_str(&dir), "--undo"], "");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(still_moved);
+    assert!(done.status.success(), "stderr: {}", stderr(&done));
+    assert!(
+        stdout(&done).contains("Put back 1 file"),
+        "{}",
+        stdout(&done)
+    );
+    assert_eq!(state, (true, false, false));
+    assert!(stdout(&again).contains("Nothing to undo"));
+}
+
+#[test]
+fn screenshots_lists_only_old_ones_and_moves_nothing() {
+    let dir = fixture("screenshots");
+    let shot = dir.join("Screenshot 2026-01-01 at 1.00.00 PM.png");
+    fs::write(&shot, vec![3u8; 5_000]).unwrap();
+    let out = run(&[path_str(&dir), "--screenshots"], "");
+    let trash = run(&[path_str(&dir), "--screenshots", "--trash"], "y\n");
+    let kept = shot.exists();
+    let _ = fs::remove_dir_all(&dir);
+    // Written moments ago: far from a day old, whatever its name says
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Screenshots older than 1 day"));
+    assert!(stdout(&out).contains("None found."));
+    assert!(trash.status.success(), "stderr: {}", stderr(&trash));
+    assert!(kept);
 }

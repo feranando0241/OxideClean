@@ -9,20 +9,26 @@
 //! - `models`      FileInfo and FileId, shared by everything below
 //! - `old_files`   forgotten files: untouched for months (see ADR-0004)
 //! - `artifacts`   build folders in forgotten projects (see ADR-0005)
+//! - `organize/`   moving loose files into folders, and undoing it (ADR-0007)
+//! - `artifact_trash` moving build folders to the Trash, re-verified from disk
 //! - `paths`       matching folders typed by the user against scanned paths
 //! - `scanner`     directory walk and ignore rules
 //! - `files`       simple queries: biggest, by type, same name, space used
 //! - `duplicates/` finding identical files, hashing, the hash cache and
 //!   moving extra copies to the Trash
+//! - `screenshots` screenshots left behind after pasting them (ADR-0008)
 //! - `similarity`  comparing documents by content
 
+pub mod artifact_trash;
 pub mod artifacts;
 pub mod duplicates;
 pub mod files;
 pub mod models;
 pub mod old_files;
+pub mod organize;
 pub mod paths;
 pub mod scanner;
+pub mod screenshots;
 pub mod similarity;
 
 #[cfg(test)]

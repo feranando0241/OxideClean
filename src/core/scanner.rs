@@ -148,6 +148,22 @@ pub fn scan_directory(dir_path: &Path, on_progress: Progress) -> io::Result<Vec<
     Ok(files)
 }
 
+/// The files directly inside `dir`, with the same ignore rules as
+/// `scan_directory` but without entering subfolders.
+pub fn scan_loose_files(dir_path: &Path) -> io::Result<Vec<FileInfo>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir_path)?.flatten() {
+        let is_file = entry.file_type().is_ok_and(|t| t.is_file());
+        if is_file
+            && !should_ignore_file(entry.file_name().to_str().unwrap_or(""))
+            && let Ok(metadata) = entry.metadata()
+        {
+            files.push(FileInfo::from_metadata(entry.path(), &metadata));
+        }
+    }
+    Ok(files)
+}
+
 /// Recursive helper that traverses the folder hierarchy.
 fn scan_recursive(
     current_path: &Path,

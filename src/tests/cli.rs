@@ -110,12 +110,29 @@ fn test_usage_errors() {
         ". --all",
         ". --dupes --all",
         ". --artifacts 300000000000000",
-        ". --artifacts 30 --trash",
+        ". --artifacts -y",
+        ". --artifacts --all --trash -y",
         ". --old 300000000000000",
         ". --old 30 --trash",
         ". --old 30 --threshold 5",
         ". other",
         "--dupes",
+        ". --organize",
+        ". --organize color",
+        ". --organize type --trash",
+        ". --organize type --yes",
+        ". --dupes --apply",
+        ". --apply",
+        ". --organize type --dupes",
+        ". --undo --apply",
+        ". --screenshots 0",
+        ". --screenshots -y",
+        ". --screenshots --apply",
+        ". --screenshots --all",
+        ". --screenshots --keep-in Photos",
+        ". --undo --trash",
+        ". --undo --organize type",
+        "--undo",
     ] {
         assert!(parse(bad).is_err(), "expected a usage error for '{}'", bad);
     }
@@ -123,7 +140,31 @@ fn test_usage_errors() {
 
 #[test]
 fn test_old_days_are_optional() {
-    let artifacts = |days, all| run(".", Some(Action::Artifacts { days, all }));
+    let artifacts = |days, all| {
+        run(
+            ".",
+            Some(Action::Artifacts {
+                days,
+                all,
+                trash: false,
+                assume_yes: false,
+            }),
+        )
+    };
+    let trashing = |all, assume_yes| {
+        run(
+            ".",
+            Some(Action::Artifacts {
+                days: DEFAULT_ARTIFACT_DAYS,
+                all,
+                trash: true,
+                assume_yes,
+            }),
+        )
+    };
+    assert_eq!(parse(". --artifacts --trash"), trashing(false, false));
+    assert_eq!(parse(". --artifacts --trash -y"), trashing(false, true));
+    assert_eq!(parse(". --artifacts --all --trash"), trashing(true, false));
     assert_eq!(
         parse(". --artifacts"),
         artifacts(DEFAULT_ARTIFACT_DAYS, false)
@@ -149,5 +190,65 @@ fn test_old_days_are_optional() {
                 exclude: vec!["Backups".into()],
             },
         })
+    );
+}
+
+#[test]
+fn test_organize_and_its_modifiers() {
+    use crate::core::organize::OrganizeBy;
+    let organize = |by, apply, assume_yes| {
+        run(
+            ".",
+            Some(Action::Organize {
+                by,
+                apply,
+                assume_yes,
+            }),
+        )
+    };
+    assert_eq!(
+        parse(". --organize year"),
+        organize(OrganizeBy::Year, false, false)
+    );
+    assert_eq!(
+        parse(". --organize size"),
+        organize(OrganizeBy::Size, false, false)
+    );
+    assert_eq!(
+        parse(". --organize words --apply"),
+        organize(OrganizeBy::Words, true, false)
+    );
+    assert_eq!(
+        parse("--apply -y . --organize type"),
+        organize(OrganizeBy::Type, true, true)
+    );
+    assert_eq!(
+        parse(". --undo"),
+        run(".", Some(Action::Undo { assume_yes: false }))
+    );
+    assert_eq!(
+        parse(". --undo --yes"),
+        run(".", Some(Action::Undo { assume_yes: true }))
+    );
+}
+
+#[test]
+fn test_screenshots_and_its_modifiers() {
+    let shots = |days, trash, assume_yes| {
+        run(
+            ".",
+            Some(Action::Screenshots {
+                days,
+                trash,
+                assume_yes,
+            }),
+        )
+    };
+    assert_eq!(parse(". --screenshots"), shots(1, false, false));
+    assert_eq!(parse(". --screenshots 7"), shots(7, false, false));
+    assert_eq!(parse(". --screenshots --trash"), shots(1, true, false));
+    assert_eq!(
+        parse(". --screenshots 30 --trash -y"),
+        shots(30, true, true)
     );
 }

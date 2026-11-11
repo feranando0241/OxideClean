@@ -46,3 +46,18 @@ fn test_should_ignore_directory() {
     assert!(!should_ignore_directory("photos"));
     assert!(!should_ignore_directory("documents"));
 }
+
+#[test]
+fn test_scan_loose_files_stays_in_the_folder() {
+    let dir = crate::core::test_support::temp_dir("scan_loose");
+    crate::core::test_support::write(&dir, "a.txt", 1);
+    crate::core::test_support::write(&dir, ".DS_Store", 1);
+    crate::core::test_support::write(&dir, "sub/b.txt", 1);
+    let names: Vec<_> = scan_loose_files(&dir)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(names, vec![dir.join("a.txt")]);
+}

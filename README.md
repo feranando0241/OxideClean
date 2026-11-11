@@ -1,6 +1,6 @@
 # OxideClean
 
-A fast, modular file scanner and organizer built in Rust. OxideClean helps you understand what is taking up space on your disk, find duplicate files, forgotten files and leftover build folders, detect similar documents, and keep your folders clean — all from the terminal.
+A fast, modular file scanner and organizer built in Rust. OxideClean helps you understand what is taking up space on your disk, find duplicate files, forgotten files, leftover build folders and old screenshots, detect similar documents, and sort loose files into folders — all from the terminal.
 
 ---
 
@@ -16,7 +16,9 @@ A fast, modular file scanner and organizer built in Rust. OxideClean helps you u
 | 6 | **Same-name file finder** | Groups files that share a filename across different folders |
 | 7 | **Document similarity** | Composite content analysis (vocabulary + bigrams + length) to find similar PDFs, text files, and source code |
 | 8 | **Forgotten files** | Big files neither modified nor read in months, and where that space is (read-only) |
-| 9 | **Build folders** | `target`, `node_modules` and Python environments of projects you stopped working on, with how to rebuild them (read-only) |
+| 9 | **Build folders** | `target`, `node_modules` and Python environments of projects you stopped working on, with how to rebuild them, and moving the ones you choose to the Trash |
+| 10 | **Organize** | Sort the files in a folder into subfolders by year, size, type or words in the name (English and Spanish), with undo |
+| 11 | **Screenshots** | Screenshots and screen recordings you only took to paste, found by the mark macOS sets on them, moved to the Trash when you choose |
 
 ---
 
@@ -77,17 +79,27 @@ oxide_clean ~/Downloads --old 365            # untouched for more than a year
 oxide_clean ~ --artifacts                    # build folders of projects untouched for 90+ days
 oxide_clean ~ --artifacts 30 --exclude Work  # 30 days, leaving a folder out
 oxide_clean ~ --artifacts --all              # every project, marking the active ones
+oxide_clean ~ --artifacts --trash            # choose which to move to the Trash
+oxide_clean ~ --artifacts --all --trash      # same, with active projects to choose from
+oxide_clean ~ --artifacts --trash -y         # move the clear-cut ones without asking
+oxide_clean ~ --screenshots                  # screenshots older than a day (read-only)
+oxide_clean ~ --screenshots --trash          # choose which to move to the Trash
+oxide_clean ~/Downloads --organize type      # plan sorting the loose files by type (read-only)
+oxide_clean ~/Downloads --organize words --apply   # sort by words in the name (asks first)
+oxide_clean ~/Downloads --undo               # put back what --organize --apply moved
 oxide_clean ~/Documents --similar thesis.pdf --threshold 50
 oxide_clean --help
 ```
 
 - `--dupes` on its own never deletes anything.
 - `--old [DAYS]` only lists; it never moves or changes anything. See [How forgotten files are found](#how-forgotten-files-are-found).
-- `--artifacts [DAYS]` only lists too; `--all` adds the projects in use. See [How build folders are found](#how-build-folders-are-found).
+- `--artifacts [DAYS]` only lists too; `--all` adds the projects in use, and `--trash` moves the ones you choose. See [How build folders are found](#how-build-folders-are-found).
+- `--screenshots [DAYS]` only lists; `--trash` moves the ones you choose. See [How screenshots are found](#how-screenshots-are-found).
+- `--organize year|size|type|words` only shows the plan; `--apply` moves, and `--undo` puts files back. See [How files are organized](#how-files-are-organized).
 - `--keep-in <FOLDER>` keeps, in each group, every copy inside that folder instead of the oldest, so nothing inside it is ever moved (groups without a copy there keep the oldest). If the folder doesn't exist or holds no copy at all, the run stops with an error and nothing is moved, so a typo can't make `--trash --yes` remove the copies you meant to keep.
 - `--exclude <FOLDER>` leaves a folder out of the scan; repeat it for several. Folders are relative to the scanned path, or full paths; `..` and symlinks to a folder inside the scan work too.
 - `--no-cache` doesn't reuse or save file hashes between runs.
-- `--trash` always asks for confirmation unless `--yes`/`-y` is given. Without a terminal to ask on (e.g. in a script), it refuses and exits with an error.
+- `--trash`, `--apply` and `--undo` always ask for confirmation unless `--yes`/`-y` is given. Without a terminal to ask on (e.g. in a script), they refuse and exit with an error.
 - Output can be piped or redirected (`> report.txt`); colors turn off automatically.
 - Exit codes: `0` success, `1` runtime error, `2` invalid arguments.
 
@@ -126,6 +138,10 @@ What would you like to do?
     6  Find files with the same name in different places
     8  Find big files nobody has touched in months
     9  Find build folders of projects you stopped working on
+    11 Find old screenshots you only took to paste
+
+  Organize
+    10 Sort the files in this folder into folders (or undo it)
 
   Compare documents
     7  Find documents with similar content
@@ -205,7 +221,7 @@ Details and measurements: [ADR-0004](docs/adr/0004-forgotten-files.md).
 
 ## How build folders are found
 
-`--artifacts` (menu option 9) lists folders that compilers and package managers generate, in projects you haven't touched for 90 days. It only lists and measures: nothing is moved, and no project tool such as `cargo` or `npm` is run, because that would execute the project's own code.
+`--artifacts` (menu option 9) lists folders that compilers and package managers generate, in projects you haven't touched for 90 days. On its own it only lists and measures. No project tool such as `cargo` or `npm` is ever run, because that would execute the project's own code.
 
 | Type | Folder | Must also have | Rated reliable when |
 |---|---|---|---|
@@ -214,13 +230,60 @@ Details and measurements: [ADR-0004](docs/adr/0004-forgotten-files.md).
 | Python | `.venv/`, `venv/` | `pyvenv.cfg` inside it | Never: few projects record exact versions |
 
 - **A closed list:** any other folder is ignored, whatever its name. Hidden folders aren't searched, which keeps the `node_modules` of your editor's extensions out.
-- **One recent file protects the whole project**, using the same rules as forgotten files. Projects in use, or that arrived in the last 30 days, are only counted.
+- **One recent file protects the whole project**, using the same rules as forgotten files, and so does recent Git activity. Projects in use, or that arrived in the last 30 days, are only counted.
 - **`--all` shows every project** with its state, because active projects pile up build files too. In the menu, answer `all`. The closed list still applies: `--all` drops the activity rule, not the others.
 - **`(!)` marks a folder whose rebuild may not give the same result**, and any old project can fail to rebuild if a package or tool has moved on.
 
-Sizes are logical file sizes, usually a little below what `du` shows. Details: [ADR-0005](docs/adr/0005-build-artifacts.md).
+Sizes are logical file sizes, usually a little below what `du` shows.
 
-**Tested promise:** a property test builds random projects mixed with look-alikes (a `target` holding a thesis, a `venv` without `pyvenv.cfg`), lists them and removes what was listed: exactly the build folders must go, and every other file must stay identical byte for byte. End-to-end tests take a real Rust project and a real Node project through build, removal and rebuild, and run the result.
+**Moving to the Trash.** With `--trash`, or from the menu, you choose what to move. Space comes back when you empty the Trash.
+
+| Case | Can it move? |
+|---|---|
+| Forgotten project, Rust or Node with a lockfile, no programs in `target/release` | Yes: the only case `y` and `--yes` reach |
+| Active project, one that can't be judged, or `(bin)`: programs in `target/release` | Only by number, and after typing `yes` |
+| Python environment or no lockfile (`-` in the list) | No |
+
+Right before each move, the tool checks from disk that the folder still qualifies, that a forgotten project wasn't used since the list, and that nothing inside changed in the last 10 minutes, which could mean a build is running. Anything that fails stays where it is, with the reason shown. `--all --trash --yes` is rejected, so a script can never reach an active project.
+
+Details: [ADR-0005](docs/adr/0005-build-artifacts.md).
+
+**Tested promise:** a property test builds random projects mixed with look-alikes (a `target` holding a thesis, a `venv` without `pyvenv.cfg`) and runs the real move on them, with a fake Trash: exactly the movable build folders must go, and every other file must stay identical byte for byte. End-to-end tests take a real Rust project and a real Node project through build, removal and rebuild, and run the result.
+
+---
+
+## How screenshots are found
+
+`--screenshots` (menu option 11) lists the screenshots and screen recordings older than a day, biggest first. They're meant for screenshots you took only to paste somewhere.
+
+- **macOS marks every screenshot** it saves, whatever its name or language. That mark is what's checked first.
+- **Without the mark** (AirDrop, downloads), a file counts only if its name starts like macOS names them, date included: `Screenshot 2026-…`, `Captura de pantalla 2026-…`, `Screen Recording 2026-…`. These show `(name)` in the list.
+- **Photo libraries are never entered**, and anything changed in the last day stays.
+- With `--trash` you choose which go to the Trash. Each one is checked again first: one you edited since the list stays.
+
+**Better still: don't save them.** Add Control to the shortcut (⌘⌃⇧4) to copy a screenshot to the clipboard without saving a file, or choose Options → Save to → Clipboard in ⌘⇧5.
+
+Details: [ADR-0008](docs/adr/0008-screenshots.md).
+
+---
+
+## How files are organized
+
+`--organize` (menu option 10) sorts the files **directly in the folder** into subfolders. Subfolders are never entered, so projects and macOS bundles like `.photoslibrary` stay whole, and hidden files stay where they are. On its own it only shows the plan.
+
+| By | Folders |
+|---|---|
+| `year` | `2024`, `2025`… from the modification date; `Unknown year` if there is none |
+| `size` | `Under 1 MB`, `1 MB to 100 MB`, `100 MB to 1 GB`, `Over 1 GB` |
+| `type` | `Images`, `Videos`, `Audio`, `Documents`, `Archives`, `Code`, `Other` |
+| `words` | `Projects` (proyecto, project), `Homework` (tarea, homework, assignment), `Websites` (website, sitio, web), `Solutions` (solución, solution), `Resumes` (resume, cv, currículum); then `PDF` and `CSV` by extension. Files with none stay put |
+
+- **Nothing is ever overwritten.** If the name is taken, the file stays and the reason is shown.
+- **Downloads in progress stay**, and so does anything changed in the last 10 minutes.
+- **Each file is checked again** right before it moves: one that changed since the plan stays.
+- **Every move is logged** in `.oxide_clean_organize.tsv` inside the folder. `--undo` (or `undo` in the menu) puts files back, newest first, again without overwriting. Whatever can't be put back stays in the log to retry.
+
+Moving onto exFAT or FAT32 drives isn't supported yet: those files are reported as not moved. Details: [ADR-0007](docs/adr/0007-organize-files.md).
 
 ---
 
@@ -241,13 +304,19 @@ src/
 ├── main.rs            — Entry point: parse arguments, pick a mode
 ├── cli.rs             — Command-line argument parsing
 ├── app.rs             — Actions shared by the CLI and the menus (incl. Trash rules)
+├── app/               — Actions with their own file: organize.rs, screenshots.rs, similar.rs
 ├── core/              — Logic only: never prints, never reads input
 │   ├── models.rs      — FileInfo (size, dates) and FileId (identity of a file's data on disk)
 │   ├── paths.rs       — Matching folders typed by the user against scanned paths
 │   ├── scanner.rs     — Recursive directory scanning and ignore rules
 │   ├── files.rs       — Biggest files, by type, same name, where the space goes
 │   ├── old_files.rs   — Forgotten files: untouched for months (ADR-0004)
-│   ├── artifacts.rs   — Build folders in forgotten projects (ADR-0005)
+│   ├── artifacts.rs   — Finding build folders in projects (ADR-0005)
+│   ├── artifact_trash.rs — Moving them to the Trash, re-verified from disk
+│   ├── screenshots.rs — Screenshots left behind after pasting (ADR-0008)
+│   ├── organize/      — Sorting loose files into folders (ADR-0007)
+│   │   ├── mod.rs        — Planning and moving, never overwriting
+│   │   └── log.rs        — The move log and undoing from it
 │   ├── duplicates/    — Everything about identical files
 │   │   ├── mod.rs        — Finding them (size → prefix → full hash)
 │   │   ├── hashing.rs    — Full and 4 KB prefix SHA-256, parallel hashing (private to duplicates/)
@@ -258,7 +327,9 @@ src/
 │   ├── style.rs       — Colors, titles, prompts, text helpers
 │   ├── report.rs      — Result screens
 │   ├── duplicates.rs  — Choosing which duplicate groups to move and what to keep
-│   ├── artifacts.rs   — The build folders screen
+│   ├── artifacts.rs   — The build folders screens: list, choosing, results
+│   ├── organize.rs    — The organize plan, questions and results
+│   ├── screenshots.rs — The screenshots screens: list, choosing, results
 │   ├── input.rs       — Reading lines, paths and group selections
 │   ├── menu.rs        — Start screen and action menu
 │   ├── browser.rs     — Folder browser
@@ -289,10 +360,10 @@ On top of that, CI rejects unformatted code (`cargo fmt --check`) and any clippy
 cargo test
 ```
 
-- **Unit tests** live in `src/tests/`, one file per module (e.g. `src/tests/core_duplicates_trash.rs` for `src/core/duplicates/trash.rs`). Each module loads its file with `#[cfg(test)] #[path = "…"] mod tests;`, so the tests can still reach private items. They cover ignore rules, duplicate detection (oldest kept, hardlinks, same prefix with different content, kept copy changed before trashing), matching folders typed by the user, forgotten files (every rule and edge case), build folders (what counts, what doesn't, symlinks, hardlinks), file queries, similarity scoring, size and age formatting, exit commands and argument parsing.
+- **Unit tests** live in `src/tests/`, one file per module (e.g. `src/tests/core_duplicates_trash.rs` for `src/core/duplicates/trash.rs`). Each module loads its file with `#[cfg(test)] #[path = "…"] mod tests;`, so the tests can still reach private items. They cover ignore rules, duplicate detection (oldest kept, hardlinks, same prefix with different content, kept copy changed before trashing), matching folders typed by the user, forgotten files (every rule and edge case), build folders (what counts, what doesn't, symlinks, hardlinks), organizing (never overwriting, files changed after the plan, names differing only in case or not valid UTF-8, words with accents in either Unicode form, undo and log lines that try to leave the folder), screenshots (names in both languages, the macOS mark read from a real file, photo libraries skipped), file queries, similarity scoring, size and age formatting, exit commands and argument parsing.
 - **Property tests** in `src/tests/core_duplicates_props.rs` build 150 random folders per run (exact copies, same-prefix-different-tail files, hardlinks, empty files, sizes around the 4 KB boundary). They check that detection matches a brute-force byte comparison with no cache, a cold cache and a warm cache. After moving the copies (to a fake Trash), they check that no content was lost, no duplicates remain and the freed space is what was promised. A failure prints the seed that reproduces it.
 - **More property tests:** forgotten files are checked against the rules written independently, and every file must land in exactly one group. Build folders are checked on random projects mixed with look-alikes: removing what is listed must remove exactly the build folders and leave every other file identical.
-- **End-to-end tests** in `tests/cli.rs` run the compiled binary against a temporary folder and check what the user sees: output and exit codes for every CLI action, the refusal to trash without a terminal, and the interactive menus. Two of them use real tools, offline: a Rust project and a Node project are built, lose their build folder, are rebuilt, and must still run. `cargo` is always there; the Node one needs `npm`, and says it was skipped if it isn't installed.
+- **End-to-end tests** in `tests/cli.rs` run the compiled binary against a temporary folder and check what the user sees: output and exit codes for every CLI action, the refusal to trash or move files without a terminal, undoing an organized folder, and the interactive menus. Two of them use real tools, offline: a Rust project and a Node project are built, lose their build folder, are rebuilt, and must still run. `cargo` is always there; the Node one needs `npm`, and says it was skipped if it isn't installed.
 
 **Continuous integration:** GitHub Actions (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on macOS and Linux for every push to `master` and every pull request. Any new warning fails the build. A separate job runs `cargo audit` against the [RustSec](https://rustsec.org) advisory database, on every push and also every Monday, since new vulnerabilities get published even when the code doesn't change.
 
@@ -305,6 +376,7 @@ cargo test
 | `sha2` | 0.11 | SHA-256 hashing for duplicate detection |
 | `trash` | 5.2.9 | Cross-platform safe move-to-Trash |
 | `pdf-extract` | 0.12 | Text extraction from PDF files |
+| `libc` | 0.2 | macOS only: reading the screenshot mark (`getxattr`). Already built for `sha2`, so it adds no new crate. It is the project's only `unsafe` code: one read-only function, see [ADR-0008](docs/adr/0008-screenshots.md) |
 
 ---
 
