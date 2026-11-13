@@ -1,8 +1,9 @@
 //! The screens for `--organize`: the plan, the confirmation and what happened.
 
 use crate::core::organize::{MoveReport, MoveSkip, OrganizeBy, OrganizePlan, PlannedMove};
-use crate::ui::input::read_line_from_user;
-use crate::ui::style::{bold, dim, error, format_size, header, hint, plural, prompt, relative};
+use crate::ui::input::confirm;
+use crate::ui::report::system_refused;
+use crate::ui::style::{bold, dim, error, format_size, header, hint, plural, relative};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -29,23 +30,7 @@ pub fn print_plan(root: &Path, plan: &OrganizePlan, by: OrganizeBy) {
         println!("\n  Nothing to organize here.");
     }
     for (folder, moves) in &by_folder {
-        let bytes: u64 = moves.iter().map(|m| m.file.size_bytes).sum();
-        println!(
-            "\n  {}/  {} · {}",
-            bold(&relative(folder, root)),
-            plural(moves.len(), "file", "files"),
-            format_size(bytes)
-        );
-        for planned in moves.iter().take(NAMES_PER_FOLDER) {
-            let name = planned.to.file_name().unwrap_or_default();
-            println!("    {}", name.to_string_lossy());
-        }
-        if moves.len() > NAMES_PER_FOLDER {
-            println!(
-                "    {}",
-                dim(&format!("… and {} more", moves.len() - NAMES_PER_FOLDER))
-            );
-        }
+        print_planned_folder(root, folder, moves);
     }
 
     if !plan.skipped.is_empty() {
@@ -55,28 +40,47 @@ pub fn print_plan(root: &Path, plan: &OrganizePlan, by: OrganizeBy) {
     println!();
 }
 
+/// One destination folder of the plan: what it would get, and the first names.
+fn print_planned_folder(root: &Path, folder: &Path, moves: &[&PlannedMove]) {
+    let bytes: u64 = moves.iter().map(|m| m.file.size_bytes).sum();
+    println!(
+        "\n  {}/  {} · {}",
+        bold(&relative(folder, root)),
+        plural(moves.len(), "file", "files"),
+        format_size(bytes)
+    );
+    for planned in moves.iter().take(NAMES_PER_FOLDER) {
+        let name = planned.to.file_name().unwrap_or_default();
+        println!("    {}", name.to_string_lossy());
+    }
+    if moves.len() > NAMES_PER_FOLDER {
+        println!(
+            "    {}",
+            dim(&format!("… and {} more", moves.len() - NAMES_PER_FOLDER))
+        );
+    }
+}
+
 /// The y/N question before moving. True only for y or yes.
 pub fn confirm_moves(count: usize) -> bool {
-    println!(
-        "Move the {}? Nothing is overwritten, and every move is logged so it can be undone.",
-        plural(count, "file", "files")
-    );
-    hint("  Type y to move them, or press Enter to leave everything as it is.");
-    prompt();
-    let answer = read_line_from_user();
-    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
+    confirm(
+        &format!(
+            "Move the {}? Nothing is overwritten, and every move is logged so it can be undone.",
+            plural(count, "file", "files")
+        ),
+        "  Type y to move them, or press Enter to leave everything as it is.",
+    )
 }
 
 /// The y/N question before undoing. True only for y or yes.
 pub fn confirm_undo(count: usize) -> bool {
-    println!(
-        "Put back the {} organizing moved here? Nothing is overwritten.",
-        plural(count, "file", "files")
-    );
-    hint("  Type y to put them back, or press Enter to leave everything as it is.");
-    prompt();
-    let answer = read_line_from_user();
-    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
+    confirm(
+        &format!(
+            "Put back the {} organizing moved here? Nothing is overwritten.",
+            plural(count, "file", "files")
+        ),
+        "  Type y to put them back, or press Enter to leave everything as it is.",
+    )
 }
 
 /// Displays what undoing did. What couldn't be put back stays in the log.
@@ -145,7 +149,7 @@ fn print_skipped(root: &Path, skipped: &[(PathBuf, MoveSkip)]) {
             MoveSkip::SameDestination => "another file here goes to the same name".to_string(),
             MoveSkip::InProgress => "it changed moments ago, maybe still downloading".to_string(),
             MoveSkip::ChangedSinceScan => "it changed since the list was made".to_string(),
-            MoveSkip::CouldNotMove(message) => format!("the system refused: {}", message),
+            MoveSkip::CouldNotMove(message) => system_refused(message),
             MoveSkip::Gone => "it's no longer where it was moved to".to_string(),
             MoveSkip::NotFromThisFolder => {
                 "the log line doesn't match a move made here, so it was left alone".to_string()

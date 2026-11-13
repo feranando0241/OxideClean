@@ -1,7 +1,7 @@
 //! `--organize`: plan moving the loose files of a folder into subfolders,
 //! and move them only after a confirmation (or `--yes`).
 
-use super::{AppError, require_terminal};
+use super::{AppError, all_moved, confirmed, nothing_moved};
 use crate::core::organize::{
     LOG_NAME, OrganizeBy, append_log, apply_plan, logged_moves, plan_organize, undo_organize,
 };
@@ -9,7 +9,7 @@ use crate::core::scanner::scan_loose_files;
 use crate::ui::organize::{
     confirm_moves, confirm_undo, print_move_report, print_plan, print_undo_report,
 };
-use crate::ui::progress::Spinner;
+use crate::ui::progress::with_spinner;
 use crate::ui::style::hint;
 use std::path::Path;
 use std::time::SystemTime;
@@ -34,33 +34,23 @@ pub fn handle_organize(
         hint("Nothing was moved. Run again with --apply to move them.\n");
         return Ok(());
     }
-    if !assume_yes {
-        require_terminal()?;
-        if !confirm_moves(plan.moves.len()) {
-            println!("Nothing was moved.\n");
-            return Ok(());
-        }
+    if !confirmed(assume_yes, || confirm_moves(plan.moves.len()))? {
+        return nothing_moved();
     }
 
-    let report = {
-        let spinner = Spinner::start("Moving files", "files");
+    let report = with_spinner(
+        "Moving files",
+        "files",
         // A fresh clock: the user may have taken a while to answer
-        apply_plan(&plan, SystemTime::now(), &|done, total| {
-            spinner.update(done, total)
-        })
-    };
+        |progress| apply_plan(&plan, SystemTime::now(), progress),
+    );
     let log_error = if report.moved.is_empty() {
         None
     } else {
         append_log(root, &report.moved).err()
     };
     print_move_report(root, &report, &root.join(LOG_NAME), log_error);
-
-    if report.skipped.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::NotAllMoved(report.skipped.len()))
-    }
+    all_moved(report.skipped.len())
 }
 
 /// Puts back every file the log of `root` records, after a y/N question
@@ -76,22 +66,14 @@ pub fn handle_undo(root: &Path, assume_yes: bool) -> Result<(), AppError> {
         println!("Nothing to undo: no files were organized in this folder.\n");
         return Ok(());
     }
-    if !assume_yes {
-        require_terminal()?;
-        if !confirm_undo(count) {
-            println!("Nothing was moved.\n");
-            return Ok(());
-        }
+    if !confirmed(assume_yes, || confirm_undo(count))? {
+        return nothing_moved();
     }
 
-    let report = {
-        let spinner = Spinner::start("Putting files back", "files");
-        undo_organize(root, &|done, total| spinner.update(done, total)).map_err(unreadable)?
-    };
+    let report = with_spinner("Putting files back", "files", |progress| {
+        undo_organize(root, progress)
+    })
+    .map_err(unreadable)?;
     print_undo_report(root, &report);
-    if report.skipped.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::NotAllMoved(report.skipped.len()))
-    }
+    all_moved(report.skipped.len())
 }

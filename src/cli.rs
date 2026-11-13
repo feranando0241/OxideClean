@@ -10,6 +10,7 @@ use crate::core::organize::OrganizeBy;
 use crate::core::screenshots::DEFAULT_SCREENSHOT_DAYS;
 use crate::core::similarity::DEFAULT_THRESHOLD;
 use std::iter::Peekable;
+use std::str::FromStr;
 
 /// Text printed by `--help`.
 pub const HELP: &str = "\
@@ -161,188 +162,36 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut path: Option<String> = None;
     let mut action: Option<Action> = None;
     let mut options = RunOptions::default();
-    let mut trash = false;
-    let mut assume_yes = false;
-    let mut keep_in: Option<String> = None;
-    let mut threshold: Option<f64> = None;
-    let mut all = false;
-    let mut apply = false;
+    let mut modifiers = Modifiers::default();
 
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
-        let new_action = match arg.as_str() {
-            "-h" | "--help" => return Ok(Command::Help),
-            "--largest" => {
-                // N is optional: only consume the next argument if it is a number
-                let n = iter.peek().and_then(|v| v.parse::<usize>().ok());
-                if n.is_some() {
-                    iter.next();
-                }
-                Some(Action::Largest(n.unwrap_or(DEFAULT_TOP)))
-            }
-            "--ext" => Some(Action::Ext(take_value(&mut iter, "--ext")?)),
-            "--dupes" => Some(Action::Dupes {
-                trash: false,
-                assume_yes: false,
-                keep_in: None,
-            }),
-            "--same-name" => Some(Action::SameName),
-            "--old" => Some(Action::Old(optional_days(
-                &mut iter,
-                "--old",
-                DEFAULT_OLD_DAYS,
-            )?)),
-            "--artifacts" => Some(Action::Artifacts {
-                days: optional_days(&mut iter, "--artifacts", DEFAULT_ARTIFACT_DAYS)?,
-                all: false,
-                trash: false,
-                assume_yes: false,
-            }),
-            "--screenshots" => Some(Action::Screenshots {
-                days: optional_days(&mut iter, "--screenshots", DEFAULT_SCREENSHOT_DAYS)?,
-                trash: false,
-                assume_yes: false,
-            }),
-            "--organize" => {
-                let raw = take_value(&mut iter, "--organize")?;
-                let by = match raw.as_str() {
-                    "year" => OrganizeBy::Year,
-                    "size" => OrganizeBy::Size,
-                    "type" => OrganizeBy::Type,
-                    "words" => OrganizeBy::Words,
-                    _ => {
-                        return Err(format!(
-                            "--organize must be year, size, type or words, got '{}'",
-                            raw
-                        ));
-                    }
-                };
-                Some(Action::Organize {
-                    by,
-                    apply: false,
-                    assume_yes: false,
-                })
-            }
-            "--undo" => Some(Action::Undo { assume_yes: false }),
-            "--apply" => {
-                apply = true;
-                None
-            }
-            "--all" => {
-                all = true;
-                None
-            }
-            "--similar" => Some(Action::Similar {
-                file: take_value(&mut iter, "--similar")?,
-                threshold: DEFAULT_THRESHOLD,
-            }),
-            "--threshold" => {
-                let raw = take_value(&mut iter, "--threshold")?;
-                let value = raw
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|v| (0.0..=100.0).contains(v))
-                    .ok_or_else(|| {
-                        format!("--threshold must be a number from 0 to 100, got '{}'", raw)
-                    })?;
-                threshold = Some(value);
-                None
-            }
-            "--keep-in" => {
-                keep_in = Some(take_value(&mut iter, "--keep-in")?);
-                None
-            }
-            "--trash" => {
-                trash = true;
-                None
-            }
-            "--yes" | "-y" => {
-                assume_yes = true;
-                None
-            }
-            "--exclude" => {
-                options.exclude.push(take_value(&mut iter, "--exclude")?);
-                None
-            }
-            "--no-cache" => {
-                options.use_cache = false;
-                None
-            }
-            flag if flag.starts_with('-') => return Err(format!("unknown option '{}'", flag)),
-            positional => {
-                if path.is_some() {
-                    return Err(format!("unexpected extra argument '{}'", positional));
-                }
-                path = Some(positional.to_string());
-                None
-            }
-        };
-
-        if let Some(new_action) = new_action {
+        let flag = arg.as_str();
+        if matches!(flag, "-h" | "--help") {
+            return Ok(Command::Help);
+        }
+        if let Some(new_action) = action_for(flag, &mut iter)? {
             if action.is_some() {
                 return Err("only one action can be used at a time".to_string());
             }
             action = Some(new_action);
+            continue;
         }
+        if modifiers.take(flag, &mut iter)? || options.take(flag, &mut iter)? {
+            continue;
+        }
+        if flag.starts_with('-') {
+            return Err(format!("unknown option '{}'", flag));
+        }
+        if path.is_some() {
+            return Err(format!("unexpected extra argument '{}'", flag));
+        }
+        path = Some(flag.to_string());
     }
 
     // Attach modifiers to their action, rejecting them anywhere else
-    let is_dupes = matches!(action, Some(Action::Dupes { .. }));
-    let is_artifacts = matches!(action, Some(Action::Artifacts { .. }));
-    let is_screenshots = matches!(action, Some(Action::Screenshots { .. }));
-    if trash && !is_dupes && !is_artifacts && !is_screenshots {
-        return Err(
-            "--trash can only be used with --dupes, --artifacts or --screenshots".to_string(),
-        );
-    }
-    if keep_in.is_some() && !is_dupes {
-        return Err("--keep-in can only be used with --dupes".to_string());
-    }
-    if apply && !matches!(action, Some(Action::Organize { .. })) {
-        return Err("--apply can only be used with --organize".to_string());
-    }
-    let is_undo = matches!(action, Some(Action::Undo { .. }));
-    if assume_yes && !trash && !apply && !is_undo {
-        return Err("--yes can only be used with --trash, --apply or --undo".to_string());
-    }
-    if all && assume_yes {
-        return Err("--yes can't be used with --all: active projects must be chosen".to_string());
-    }
-    if all && !matches!(action, Some(Action::Artifacts { .. })) {
-        return Err("--all can only be used with --artifacts".to_string());
-    }
-    if threshold.is_some() && !matches!(action, Some(Action::Similar { .. })) {
-        return Err("--threshold can only be used with --similar".to_string());
-    }
-    let action = match action {
-        Some(Action::Dupes { .. }) => Some(Action::Dupes {
-            trash,
-            assume_yes,
-            keep_in,
-        }),
-        Some(Action::Similar { file, .. }) => Some(Action::Similar {
-            file,
-            threshold: threshold.unwrap_or(DEFAULT_THRESHOLD),
-        }),
-        Some(Action::Artifacts { days, .. }) => Some(Action::Artifacts {
-            days,
-            all,
-            trash,
-            assume_yes,
-        }),
-        Some(Action::Organize { by, .. }) => Some(Action::Organize {
-            by,
-            apply,
-            assume_yes,
-        }),
-        Some(Action::Screenshots { days, .. }) => Some(Action::Screenshots {
-            days,
-            trash,
-            assume_yes,
-        }),
-        Some(Action::Undo { .. }) => Some(Action::Undo { assume_yes }),
-        other => other,
-    };
+    modifiers.check(action.as_ref())?;
+    let action = action.map(|action| modifiers.attach(action));
 
     let path = path.ok_or("missing <PATH> to scan")?;
     Ok(Command::Run {
@@ -350,6 +199,171 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         action,
         options,
     })
+}
+
+/// The action `flag` asks for, taking the value that follows it if it has
+/// one. `None` if `flag` isn't an action. Its modifiers start out off: they
+/// are attached once every argument has been read (`Modifiers::attach`).
+fn action_for<'a, I: Iterator<Item = &'a String>>(
+    flag: &str,
+    iter: &mut Peekable<I>,
+) -> Result<Option<Action>, String> {
+    let action = match flag {
+        "--largest" => Action::Largest(optional_number(iter).unwrap_or(DEFAULT_TOP)),
+        "--ext" => Action::Ext(take_value(iter, flag)?),
+        "--dupes" => Action::Dupes {
+            trash: false,
+            assume_yes: false,
+            keep_in: None,
+        },
+        "--same-name" => Action::SameName,
+        "--old" => Action::Old(optional_days(iter, flag, DEFAULT_OLD_DAYS)?),
+        "--artifacts" => Action::Artifacts {
+            days: optional_days(iter, flag, DEFAULT_ARTIFACT_DAYS)?,
+            all: false,
+            trash: false,
+            assume_yes: false,
+        },
+        "--screenshots" => Action::Screenshots {
+            days: optional_days(iter, flag, DEFAULT_SCREENSHOT_DAYS)?,
+            trash: false,
+            assume_yes: false,
+        },
+        "--organize" => Action::Organize {
+            by: organize_by(&take_value(iter, flag)?)?,
+            apply: false,
+            assume_yes: false,
+        },
+        "--undo" => Action::Undo { assume_yes: false },
+        "--similar" => Action::Similar {
+            file: take_value(iter, flag)?,
+            threshold: DEFAULT_THRESHOLD,
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(action))
+}
+
+/// The flags that change what an action does. They can come before or after
+/// their action, so they are collected first and attached at the end.
+#[derive(Default)]
+struct Modifiers {
+    trash: bool,
+    assume_yes: bool,
+    keep_in: Option<String>,
+    threshold: Option<f64>,
+    all: bool,
+    apply: bool,
+}
+
+impl Modifiers {
+    /// Records `flag` if it is a modifier, taking the value that follows it
+    /// if it has one. False if it isn't a modifier.
+    fn take<'a>(
+        &mut self,
+        flag: &str,
+        iter: &mut impl Iterator<Item = &'a String>,
+    ) -> Result<bool, String> {
+        match flag {
+            "--trash" => self.trash = true,
+            "--yes" | "-y" => self.assume_yes = true,
+            "--all" => self.all = true,
+            "--apply" => self.apply = true,
+            "--keep-in" => self.keep_in = Some(take_value(iter, flag)?),
+            "--threshold" => self.threshold = Some(percentage(&take_value(iter, flag)?)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Rejects a modifier given without the action it belongs to.
+    fn check(&self, action: Option<&Action>) -> Result<(), String> {
+        let is_dupes = matches!(action, Some(Action::Dupes { .. }));
+        let is_artifacts = matches!(action, Some(Action::Artifacts { .. }));
+        let is_screenshots = matches!(action, Some(Action::Screenshots { .. }));
+        let is_organize = matches!(action, Some(Action::Organize { .. }));
+        let is_undo = matches!(action, Some(Action::Undo { .. }));
+        let is_similar = matches!(action, Some(Action::Similar { .. }));
+
+        let problem = if self.trash && !is_dupes && !is_artifacts && !is_screenshots {
+            "--trash can only be used with --dupes, --artifacts or --screenshots"
+        } else if self.keep_in.is_some() && !is_dupes {
+            "--keep-in can only be used with --dupes"
+        } else if self.apply && !is_organize {
+            "--apply can only be used with --organize"
+        } else if self.assume_yes && !self.trash && !self.apply && !is_undo {
+            "--yes can only be used with --trash, --apply or --undo"
+        } else if self.all && self.assume_yes {
+            "--yes can't be used with --all: active projects must be chosen"
+        } else if self.all && !is_artifacts {
+            "--all can only be used with --artifacts"
+        } else if self.threshold.is_some() && !is_similar {
+            "--threshold can only be used with --similar"
+        } else {
+            return Ok(());
+        };
+        Err(problem.to_string())
+    }
+
+    /// `action` with its modifiers filled in. Call `check` first.
+    fn attach(self, action: Action) -> Action {
+        let Modifiers {
+            trash,
+            assume_yes,
+            keep_in,
+            threshold,
+            all,
+            apply,
+        } = self;
+        match action {
+            Action::Dupes { .. } => Action::Dupes {
+                trash,
+                assume_yes,
+                keep_in,
+            },
+            Action::Similar { file, .. } => Action::Similar {
+                file,
+                threshold: threshold.unwrap_or(DEFAULT_THRESHOLD),
+            },
+            Action::Artifacts { days, .. } => Action::Artifacts {
+                days,
+                all,
+                trash,
+                assume_yes,
+            },
+            Action::Organize { by, .. } => Action::Organize {
+                by,
+                apply,
+                assume_yes,
+            },
+            Action::Screenshots { days, .. } => Action::Screenshots {
+                days,
+                trash,
+                assume_yes,
+            },
+            Action::Undo { .. } => Action::Undo { assume_yes },
+            // These take no modifiers. Listed one by one so that a new action
+            // has to say here which ones it takes.
+            Action::Largest(_) | Action::Ext(_) | Action::SameName | Action::Old(_) => action,
+        }
+    }
+}
+
+impl RunOptions {
+    /// Records `flag` if it is one of these options, taking the value that
+    /// follows it if it has one. False if it isn't one.
+    fn take<'a>(
+        &mut self,
+        flag: &str,
+        iter: &mut impl Iterator<Item = &'a String>,
+    ) -> Result<bool, String> {
+        match flag {
+            "--exclude" => self.exclude.push(take_value(iter, flag)?),
+            "--no-cache" => self.use_cache = false,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
 }
 
 /// Takes the value that must follow `flag`, e.g. `--ext pdf`.
@@ -363,18 +377,25 @@ fn take_value<'a>(
     }
 }
 
-/// A flag's optional number of days, like N in --largest: the next argument
-/// is only taken if it is a number.
+/// A flag's optional number, like N in `--largest [N]`: the next argument is
+/// only taken if it is a number.
+fn optional_number<'a, T: FromStr, I: Iterator<Item = &'a String>>(
+    iter: &mut Peekable<I>,
+) -> Option<T> {
+    let n = iter.peek().and_then(|v| v.parse::<T>().ok());
+    if n.is_some() {
+        iter.next();
+    }
+    n
+}
+
+/// A flag's optional number of days, which must be a usable threshold.
 fn optional_days<'a, I: Iterator<Item = &'a String>>(
     iter: &mut Peekable<I>,
     flag: &str,
     default: u64,
 ) -> Result<u64, String> {
-    let n = iter.peek().and_then(|v| v.parse::<u64>().ok());
-    if n.is_some() {
-        iter.next();
-    }
-    let n = n.unwrap_or(default);
+    let n = optional_number(iter).unwrap_or(default);
     if n == 0 {
         return Err(format!("{} needs at least 1 day", flag));
     }
@@ -382,6 +403,24 @@ fn optional_days<'a, I: Iterator<Item = &'a String>>(
         return Err(format!("{} {} is too many days", flag, n));
     }
     Ok(n)
+}
+
+/// The value of `--organize`.
+fn organize_by(raw: &str) -> Result<OrganizeBy, String> {
+    OrganizeBy::from_name(raw).ok_or_else(|| {
+        format!(
+            "--organize must be year, size, type or words, got '{}'",
+            raw
+        )
+    })
+}
+
+/// The value of `--threshold`: a percentage from 0 to 100.
+fn percentage(raw: &str) -> Result<f64, String> {
+    raw.parse::<f64>()
+        .ok()
+        .filter(|v| (0.0..=100.0).contains(v))
+        .ok_or_else(|| format!("--threshold must be a number from 0 to 100, got '{}'", raw))
 }
 
 #[cfg(test)]

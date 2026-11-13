@@ -120,66 +120,90 @@ fn is_real_dir(path: &Path) -> bool {
 
 /// The build folders in `dir`, as far as the closed list of ADR-0005 goes.
 pub(crate) fn candidates_in(dir: &Path) -> Vec<Candidate> {
-    let mut found = Vec::new();
+    rust_candidate(dir)
+        .into_iter()
+        .chain(node_candidate(dir))
+        .chain(python_candidates(dir))
+        .collect()
+}
 
+/// Rust and Node: only a lockfile records the exact versions.
+fn lockfile_confidence(has_lockfile: bool) -> Confidence {
+    if has_lockfile {
+        Confidence::Pinned
+    } else {
+        Confidence::NoLockfile
+    }
+}
+
+/// `target/` beside a `Cargo.toml`. Cargo's own tag inside it is what proves
+/// that Cargo made the folder.
+fn rust_candidate(dir: &Path) -> Option<Candidate> {
     let target = dir.join("target");
-    if dir.join("Cargo.toml").is_file() && is_real_dir(&target) {
-        found.push(Candidate {
-            verified: target.join("CACHEDIR.TAG").is_file(),
-            path: target,
-            kind: ArtifactKind::Rust,
-            rebuild: Some("cargo build"),
-            confidence: if dir.join("Cargo.lock").is_file() {
-                Confidence::Pinned
-            } else {
-                Confidence::NoLockfile
-            },
-        });
+    if !dir.join("Cargo.toml").is_file() || !is_real_dir(&target) {
+        return None;
     }
+    Some(Candidate {
+        verified: target.join("CACHEDIR.TAG").is_file(),
+        path: target,
+        kind: ArtifactKind::Rust,
+        rebuild: Some("cargo build"),
+        confidence: lockfile_confidence(dir.join("Cargo.lock").is_file()),
+    })
+}
 
+/// `node_modules/` beside a `package.json`, rebuilt with whichever tool left
+/// its lockfile.
+fn node_candidate(dir: &Path) -> Option<Candidate> {
     let node_modules = dir.join("node_modules");
-    if dir.join("package.json").is_file() && is_real_dir(&node_modules) {
-        let lockfile = NODE_LOCKFILES
-            .iter()
-            .find(|(name, _)| dir.join(name).is_file());
-        found.push(Candidate {
-            path: node_modules,
-            kind: ArtifactKind::Node,
-            rebuild: Some(lockfile.map_or("npm install", |(_, command)| command)),
-            confidence: if lockfile.is_some() {
-                Confidence::Pinned
-            } else {
-                Confidence::NoLockfile
-            },
-            verified: true,
-        });
+    if !dir.join("package.json").is_file() || !is_real_dir(&node_modules) {
+        return None;
     }
+    let lockfile = NODE_LOCKFILES
+        .iter()
+        .find(|(name, _)| dir.join(name).is_file());
+    Some(Candidate {
+        path: node_modules,
+        kind: ArtifactKind::Node,
+        rebuild: Some(lockfile.map_or("npm install", |(_, command)| command)),
+        confidence: lockfile_confidence(lockfile.is_some()),
+        verified: true,
+    })
+}
 
-    for name in [".venv", "venv"] {
-        let venv = dir.join(name);
-        if !is_real_dir(&venv) || !venv.join("pyvenv.cfg").is_file() {
-            continue;
-        }
-        let rebuild = if dir.join("requirements.txt").is_file() {
-            Some("pip install -r requirements.txt")
-        } else if dir.join("pyproject.toml").is_file() {
-            Some("pip install .")
-        } else {
-            None
-        };
-        found.push(Candidate {
-            path: venv,
-            kind: ArtifactKind::Python,
-            rebuild,
-            confidence: if rebuild.is_some() {
-                Confidence::PythonList
-            } else {
-                Confidence::NoRecord
-            },
-            verified: true,
-        });
+/// `.venv/` and `venv/` holding a `pyvenv.cfg`, which only Python writes.
+fn python_candidates(dir: &Path) -> Vec<Candidate> {
+    [".venv", "venv"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .filter(|venv| is_real_dir(venv) && venv.join("pyvenv.cfg").is_file())
+        .map(|venv| {
+            let rebuild = python_rebuild(dir);
+            Candidate {
+                path: venv,
+                kind: ArtifactKind::Python,
+                rebuild,
+                confidence: if rebuild.is_some() {
+                    Confidence::PythonList
+                } else {
+                    Confidence::NoRecord
+                },
+                verified: true,
+            }
+        })
+        .collect()
+}
+
+/// The command that reinstalls a Python project's packages, if a file in
+/// `dir` lists them.
+fn python_rebuild(dir: &Path) -> Option<&'static str> {
+    if dir.join("requirements.txt").is_file() {
+        Some("pip install -r requirements.txt")
+    } else if dir.join("pyproject.toml").is_file() {
+        Some("pip install .")
+    } else {
+        None
     }
-    found
 }
 
 /// What `measure` learned about a folder.
@@ -377,33 +401,44 @@ pub fn find_artifacts(
     on_progress(0, listed.len());
     let total = listed.len();
     for (done, (project, candidate, state, untouched)) in listed.into_iter().enumerate() {
-        let measured = measure(&candidate.path);
-        let size = measured.size;
-        let programs = if candidate.kind == ArtifactKind::Rust {
-            built_programs(&candidate.path)
-        } else {
-            0
-        };
-        report.total.bytes += size.bytes;
-        report.total.files += size.files;
-        report.found.push(Artifact {
-            project,
-            path: candidate.path,
-            kind: candidate.kind,
-            size,
-            unreadable: measured.unreadable,
-            state,
-            untouched,
-            rebuild: candidate.rebuild,
-            confidence: candidate.confidence,
-            built_programs: programs,
-        });
+        let artifact = measured_artifact(project, candidate, state, untouched);
+        report.total.bytes += artifact.size.bytes;
+        report.total.files += artifact.size.files;
+        report.found.push(artifact);
         on_progress(done + 1, total);
     }
     report
         .found
         .sort_by_cached_key(|a| (Reverse(a.size.bytes), a.path.clone()));
     report
+}
+
+/// The listed `candidate` of `project` with what only reading the folder
+/// tells: its size and, for Cargo, the programs in `release/`.
+fn measured_artifact(
+    project: PathBuf,
+    candidate: Candidate,
+    state: ProjectState,
+    untouched: Option<Duration>,
+) -> Artifact {
+    let measured = measure(&candidate.path);
+    let programs = if candidate.kind == ArtifactKind::Rust {
+        built_programs(&candidate.path)
+    } else {
+        0
+    };
+    Artifact {
+        project,
+        path: candidate.path,
+        kind: candidate.kind,
+        size: measured.size,
+        unreadable: measured.unreadable,
+        state,
+        untouched,
+        rebuild: candidate.rebuild,
+        confidence: candidate.confidence,
+        built_programs: programs,
+    }
 }
 
 #[cfg(test)]

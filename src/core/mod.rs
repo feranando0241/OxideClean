@@ -18,6 +18,8 @@
 //!   moving extra copies to the Trash
 //! - `screenshots` screenshots left behind after pasting them (ADR-0008)
 //! - `similarity`  comparing documents by content
+//! - `trash`       what every move to the Trash shares: one attempt per item
+//!   and a report of what stayed and why
 
 pub mod artifact_trash;
 pub mod artifacts;
@@ -30,6 +32,7 @@ pub mod paths;
 pub mod scanner;
 pub mod screenshots;
 pub mod similarity;
+pub mod trash;
 
 #[cfg(test)]
 #[path = "../tests/core_test_support.rs"]

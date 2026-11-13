@@ -1,6 +1,6 @@
 //! The log of the moves made by organizing, and undoing them from it.
 
-use super::{MoveReport, MoveSkip, move_no_overwrite};
+use super::{MoveReport, MoveSkip, move_no_overwrite, refused};
 use crate::core::Progress;
 use std::fs;
 use std::io;
@@ -34,10 +34,15 @@ pub fn append_log(root: &Path, moved: &[(PathBuf, PathBuf)]) -> io::Result<()> {
         .write_all(lines.as_bytes())
 }
 
+/// The moves a log's text records, one per line, oldest first.
+fn log_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().filter(|line| !line.is_empty())
+}
+
 /// How many moves the log of `root` holds; 0 when there is no log.
 pub fn logged_moves(root: &Path) -> io::Result<usize> {
     match fs::read_to_string(root.join(LOG_NAME)) {
-        Ok(text) => Ok(text.lines().filter(|l| !l.is_empty()).count()),
+        Ok(text) => Ok(log_lines(&text).count()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(0),
         Err(err) => Err(err),
     }
@@ -59,7 +64,7 @@ pub fn undo_with(
 ) -> io::Result<MoveReport> {
     let log = root.join(LOG_NAME);
     let text = fs::read_to_string(&log)?;
-    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = log_lines(&text).collect();
     let mut report = MoveReport::default();
     let mut kept: Vec<&str> = Vec::new();
     on_progress(0, lines.len());
@@ -117,9 +122,6 @@ fn restore(
     }
     match mv(&to, &from) {
         Ok(()) => Ok((to, from)),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            Err((to, MoveSkip::DestinationExists))
-        }
-        Err(err) => Err((to, MoveSkip::CouldNotMove(err.to_string()))),
+        Err(err) => Err((to, refused(err))),
     }
 }

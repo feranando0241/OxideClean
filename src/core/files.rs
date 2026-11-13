@@ -71,24 +71,26 @@ fn usage_by<K: Hash + Eq + Ord>(
     rows
 }
 
+/// The space `files` take up together, in bytes.
+pub fn total_size(files: &[FileInfo]) -> u64 {
+    files.iter().map(|f| f.size_bytes).sum()
+}
+
 /// Returns the `n` heaviest files in the list, sorted from largest to smallest.
 pub fn get_top_largest(files: &[FileInfo], n: usize) -> Vec<FileInfo> {
     let mut sorted = files.to_vec();
     sorted.sort_by_key(|f| Reverse(f.size_bytes));
-    sorted.into_iter().take(n).collect()
+    sorted.truncate(n);
+    sorted
 }
 
 /// Filters files that match a specific extension (e.g. "pdf", "png").
 pub fn filter_by_extension(files: &[FileInfo], ext: &str) -> Vec<FileInfo> {
+    // `FileInfo` extensions are already lowercase
     let clean_ext = ext.trim().trim_start_matches('.').to_lowercase();
     files
         .iter()
-        .filter(|f| {
-            f.extension
-                .as_ref()
-                .map(|e| e == &clean_ext)
-                .unwrap_or(false)
-        })
+        .filter(|f| f.extension.as_deref() == Some(clean_ext.as_str()))
         .cloned()
         .collect()
 }
@@ -149,8 +151,11 @@ pub fn find_same_name_files(files: &[FileInfo]) -> Vec<SameNameGroup> {
         .map(|(shared_name, files)| SameNameGroup { shared_name, files })
         .collect();
 
-    // Sort by most to least matches
-    groups.sort_by_key(|g| Reverse(g.files.len()));
+    // Sort by most to least matches; ties by name, so the order is the same
+    // on every run
+    groups.sort_by(|a, b| {
+        (Reverse(a.files.len()), &a.shared_name).cmp(&(Reverse(b.files.len()), &b.shared_name))
+    });
 
     groups
 }

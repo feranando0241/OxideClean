@@ -5,9 +5,9 @@
 use crate::core::Progress;
 use crate::core::models::FileInfo;
 use crate::core::organize::fold_accents;
+use crate::core::trash::{TrashOutcome, attempt_each, move_to_trash};
 use std::cmp::Reverse;
-use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::time::{Duration, SystemTime};
 
 /// Screenshots older than this many days are listed by default: they were
@@ -66,13 +66,7 @@ pub enum ScreenshotSkip {
 
 /// Outcome of moving screenshots to the Trash. Every file is attempted; one
 /// failure doesn't stop the rest.
-#[derive(Debug, Default)]
-pub struct ScreenshotTrashReport {
-    pub moved: usize,
-    /// Space they hold. It only comes back when the Trash is emptied.
-    pub moved_bytes: u64,
-    pub skipped: Vec<(PathBuf, ScreenshotSkip)>,
-}
+pub type ScreenshotTrashReport = TrashOutcome<ScreenshotSkip>;
 
 /// The screenshots among `files` not changed for longer than `threshold`,
 /// biggest first. Reads the mark from disk, but only for capture formats.
@@ -178,9 +172,7 @@ pub fn trash_screenshots(
     threshold: Duration,
     on_progress: Progress,
 ) -> ScreenshotTrashReport {
-    remove_screenshots(selected, now, threshold, on_progress, &|path| {
-        trash::delete(path).map_err(|e| e.to_string())
-    })
+    remove_screenshots(selected, now, threshold, on_progress, &move_to_trash)
 }
 
 /// `trash_screenshots` with the removal step passed in, so tests can run the
@@ -192,38 +184,26 @@ pub fn remove_screenshots(
     on_progress: Progress,
     remove: &dyn Fn(&Path) -> Result<(), String>,
 ) -> ScreenshotTrashReport {
-    let mut report = ScreenshotTrashReport::default();
-    on_progress(0, selected.len());
-    for (done, shot) in selected.iter().enumerate() {
-        let path = &shot.file.path;
-        let outcome = if unchanged(shot, now, threshold) {
-            remove(path).map_err(ScreenshotSkip::CouldNotMove)
-        } else {
-            Err(ScreenshotSkip::ChangedSinceScan)
-        };
-        match outcome {
-            Ok(()) => {
-                report.moved += 1;
-                report.moved_bytes += shot.file.size_bytes;
+    attempt_each(
+        selected,
+        |shot| shot.file.path.as_path(),
+        on_progress,
+        |shot| {
+            if !unchanged(shot, now, threshold) {
+                return Err(ScreenshotSkip::ChangedSinceScan);
             }
-            Err(skip) => report.skipped.push((path.clone(), skip)),
-        }
-        on_progress(done + 1, selected.len());
-    }
-    report
+            remove(&shot.file.path).map_err(ScreenshotSkip::CouldNotMove)?;
+            Ok(shot.file.size_bytes)
+        },
+    )
 }
 
 /// From disk: still a regular file, same size and date as listed, and still
 /// old enough (an edit since the list makes it recent).
 fn unchanged(shot: &Screenshot, now: SystemTime, threshold: Duration) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(&shot.file.path) else {
-        return false;
-    };
-    let current = FileInfo::from_metadata(shot.file.path.clone(), &metadata);
-    metadata.is_file()
-        && current.size_bytes == shot.file.size_bytes
-        && current.modified == shot.file.modified
-        && age_of(&current, now).is_some_and(|age| age > threshold)
+    shot.file
+        .unchanged_on_disk()
+        .is_some_and(|current| age_of(&current, now).is_some_and(|age| age > threshold))
 }
 
 #[cfg(test)]

@@ -74,22 +74,29 @@ const IGNORED_EXTENSIONS: &[&str] = &[
     "o",     // C/C++ compiled object file
 ];
 
+/// Endings of folder names ignored whatever comes before them.
+const IGNORED_DIRECTORY_SUFFIXES: &[&str] = &[
+    // Python virtual environment variants: project_venv, my-env, report_venv, etc.
+    "_venv",
+    "-venv",
+    "-env",
+    // macOS application bundles
+    ".app",
+    ".framework",
+    ".bundle",
+];
+
 /// Determines whether an individual file should be ignored.
 ///
 /// Ignores files in the exact-match list and those with bytecode/binary extensions.
-/// Note: `rsplit('.')` returns the file name itself when there is no dot, so
-/// single-extension-less files are safely handled without false positives.
+/// A name without an extension is never ignored for it: a file called `o` or
+/// `class` is a file like any other.
 pub fn should_ignore_file(file_name: &str) -> bool {
-    if IGNORED_FILES.contains(&file_name) {
-        return true;
-    }
-    // Ignore by extension (bytecode and compiled files)
-    if let Some(ext) = file_name.rsplit('.').next()
-        && IGNORED_EXTENSIONS.contains(&ext)
-    {
-        return true;
-    }
-    false
+    IGNORED_FILES.contains(&file_name)
+        || Path::new(file_name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| IGNORED_EXTENSIONS.contains(&ext))
 }
 
 /// Determines whether a directory name should be ignored during scanning.
@@ -98,43 +105,39 @@ pub fn should_ignore_file(file_name: &str) -> bool {
 /// those ending in `_venv` or `-env` (Python virtual environment variants),
 /// and macOS application bundles (`.app`, `.framework`, `.bundle`).
 pub fn should_ignore_directory(dir_name: &str) -> bool {
-    if IGNORED_DIRECTORIES.contains(&dir_name) {
-        return true;
+    IGNORED_DIRECTORIES.contains(&dir_name)
+        // Hidden system folders (start with a dot), except "." which is the current directory
+        || (dir_name.starts_with('.') && dir_name != ".")
+        || IGNORED_DIRECTORY_SUFFIXES
+            .iter()
+            .any(|suffix| dir_name.ends_with(suffix))
+}
+
+/// True if the scan skips the folder behind `entry`. A name that isn't valid
+/// UTF-8 matches no rule.
+fn is_ignored_directory(entry: &fs::DirEntry) -> bool {
+    should_ignore_directory(entry.file_name().to_str().unwrap_or(""))
+}
+
+/// The entry as a scanned file, or `None` if its name is on the ignore list
+/// or its details can't be read.
+fn scanned_file(entry: &fs::DirEntry) -> Option<FileInfo> {
+    if should_ignore_file(entry.file_name().to_str().unwrap_or("")) {
+        return None;
     }
-    // Hidden system folders (start with a dot), except "." which is the current directory
-    if dir_name.starts_with('.') && dir_name != "." {
-        return true;
-    }
-    // Python virtual environment variants: project_venv, my-env, report_venv, etc.
-    if dir_name.ends_with("_venv") || dir_name.ends_with("-venv") || dir_name.ends_with("-env") {
-        return true;
-    }
-    // macOS application bundles (.app, .framework, .bundle)
-    if dir_name.ends_with(".app")
-        || dir_name.ends_with(".framework")
-        || dir_name.ends_with(".bundle")
-    {
-        return true;
-    }
-    false
+    let metadata = entry.metadata().ok()?;
+    Some(FileInfo::from_metadata(entry.path(), &metadata))
 }
 
 /// Scans a directory and lists only its immediately accessible subdirectories.
 pub fn list_accessible_subdirectories(dir_path: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut dirs = Vec::new();
-    let entries = fs::read_dir(dir_path)?;
-
     // Unreadable entries are skipped instead of failing the whole listing
-    for entry in entries.flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            let file_name = entry.file_name();
-            let name_str = file_name.to_str().unwrap_or("");
-            if !should_ignore_directory(name_str) {
-                dirs.push(entry.path());
-            }
-        }
-    }
-
+    let mut dirs: Vec<PathBuf> = fs::read_dir(dir_path)?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|entry| !is_ignored_directory(entry))
+        .map(|entry| entry.path())
+        .collect();
     dirs.sort();
     Ok(dirs)
 }
@@ -151,17 +154,11 @@ pub fn scan_directory(dir_path: &Path, on_progress: Progress) -> io::Result<Vec<
 /// The files directly inside `dir`, with the same ignore rules as
 /// `scan_directory` but without entering subfolders.
 pub fn scan_loose_files(dir_path: &Path) -> io::Result<Vec<FileInfo>> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(dir_path)?.flatten() {
-        let is_file = entry.file_type().is_ok_and(|t| t.is_file());
-        if is_file
-            && !should_ignore_file(entry.file_name().to_str().unwrap_or(""))
-            && let Ok(metadata) = entry.metadata()
-        {
-            files.push(FileInfo::from_metadata(entry.path(), &metadata));
-        }
-    }
-    Ok(files)
+    Ok(fs::read_dir(dir_path)?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|entry| scanned_file(&entry))
+        .collect())
 }
 
 /// Recursive helper that traverses the folder hierarchy.
@@ -180,24 +177,14 @@ fn scan_recursive(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let name_str = file_name.to_str().unwrap_or("");
-
         if file_type.is_dir() {
-            if should_ignore_directory(name_str) {
-                continue;
+            if !is_ignored_directory(&entry) {
+                scan_recursive(&entry.path(), files, on_progress)?;
             }
-            scan_recursive(&path, files, on_progress)?;
-        } else if file_type.is_file() {
-            if should_ignore_file(name_str) {
-                continue;
-            }
-
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            files.push(FileInfo::from_metadata(path, &metadata));
+        } else if file_type.is_file()
+            && let Some(file) = scanned_file(&entry)
+        {
+            files.push(file);
             on_progress(files.len(), 0);
         }
     }

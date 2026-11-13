@@ -125,6 +125,12 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// A size for a table column: right-aligned to 10 characters, then bold
+/// (padding goes first, see `paint`).
+pub fn size_cell(bytes: u64) -> String {
+    bold(&format!("{:>10}", format_size(bytes)))
+}
+
 /// A rough, human age like "12 days", "8 months" or "3 years". Months are
 /// 30 days and years 365: precise enough to judge what's old, and no calendar
 /// or time zone involved.

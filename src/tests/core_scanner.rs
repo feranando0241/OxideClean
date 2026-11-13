@@ -61,3 +61,14 @@ fn test_scan_loose_files_stays_in_the_folder() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(names, vec![dir.join("a.txt")]);
 }
+
+#[test]
+fn test_files_are_ignored_by_extension_not_by_name() {
+    assert!(should_ignore_file("main.o"));
+    assert!(should_ignore_file("App.class"));
+    assert!(should_ignore_file(".DS_Store"));
+    // No extension: the whole name must not be taken for one
+    for name in ["o", "class", "pyc", "pyo"] {
+        assert!(!should_ignore_file(name), "'{}' was ignored", name);
+    }
+}

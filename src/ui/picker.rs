@@ -5,135 +5,134 @@ use crate::ui::input::read_line_from_user;
 use crate::ui::style::{bold, dim, error, folder_of, hint, plural, prompt, truncate};
 use std::path::Path;
 
+/// Documents shown per page.
+const PAGE_SIZE: usize = 20;
+
 /// Displays a paginated file list (20 per page) and lets the user
 /// navigate pages or search by name before selecting.
 ///
 /// Returns the chosen file, or `None` if the user cancels.
 pub fn select_file_paginated<'a>(root: &Path, files: &[&'a FileInfo]) -> Option<&'a FileInfo> {
-    const PAGE_SIZE: usize = 20;
-    let total = files.len();
-    // total_pages is fixed: used in the header when no search is active.
-    // page_total is recalculated each iteration to reflect the active list (may be filtered).
-    let total_pages = total.div_ceil(PAGE_SIZE);
     let mut current_page: usize = 0;
-    // Active list: may be the full listing or a search result.
-    let mut active_list: Vec<&FileInfo> = files.to_vec();
-    let mut search_active = false;
+    // What is listed: every document, or only the ones a search found
+    let mut listed: Vec<&'a FileInfo> = files.to_vec();
+    let mut searching = false;
 
     loop {
-        let page_total = active_list.len().div_ceil(PAGE_SIZE).max(1);
-        let page = current_page.min(page_total - 1);
-        let start = page * PAGE_SIZE;
-        let end = (start + PAGE_SIZE).min(active_list.len());
-        let page_slice = &active_list[start..end];
-
-        // Page header
-        let shown = if search_active {
-            format!("{} matching your search", active_list.len())
-        } else {
-            plural(total, "document", "documents")
-        };
-        let page_info = if page_total > 1 {
-            format!(
-                " · page {} of {}",
-                page + 1,
-                if search_active {
-                    page_total
-                } else {
-                    total_pages
-                }
-            )
-        } else {
-            String::new()
-        };
-        hint(&format!("\n{}{}", shown, page_info));
-
-        for (i, f) in page_slice.iter().enumerate() {
-            println!(
-                "  {:>3}  {:<34}  {}",
-                start + i + 1,
-                truncate(f.name(), 34),
-                dim(&truncate(&folder_of(f, root), 30)),
-            );
-        }
-        println!();
-
-        println!("  • Type a number   to pick that document");
-        // Only show pagination options when there is more than one page
-        if page + 1 < page_total {
-            println!("  • Type n          for the next page");
-        }
-        if page > 0 {
-            println!("  • Type p          for the previous page");
-        }
-        if search_active {
-            println!("  • Type r          to show all documents again");
-        } else {
-            println!("  • Type s          to search by name");
-        }
-        println!("  • Type 0          to cancel");
+        let pages = listed.len().div_ceil(PAGE_SIZE).max(1);
+        let page = current_page.min(pages - 1);
+        print_page(root, &listed, page, pages, searching);
+        print_choices(page, pages, searching);
         prompt();
 
-        let input = read_line_from_user();
-
-        match input.to_lowercase().as_str() {
+        match read_line_from_user().to_lowercase().as_str() {
             "0" | "cancel" => return None,
 
-            "n" if page + 1 < page_total => {
-                current_page = page + 1;
-            }
-            "p" if page > 0 => {
-                current_page = page - 1;
-            }
+            "n" if page + 1 < pages => current_page = page + 1,
+            "p" if page > 0 => current_page = page - 1,
 
-            "s" | "b" => {
-                println!("Type part of the name:");
-                prompt();
-                let query = read_line_from_user().to_lowercase();
-                if query.is_empty() {
+            "s" | "b" => match ask_search(files) {
+                None => {
                     hint("Empty search, showing all documents.");
-                    active_list = files.to_vec();
-                    search_active = false;
-                } else {
-                    active_list = files
-                        .iter()
-                        .filter(|f| f.name().to_lowercase().contains(&query))
-                        .copied()
-                        .collect();
-                    search_active = true;
-                    current_page = 0;
-
-                    if active_list.is_empty() {
-                        error(&format!(
-                            "No document name contains '{}'. Showing all again.",
-                            query
-                        ));
-                        active_list = files.to_vec();
-                        search_active = false;
-                    }
+                    listed = files.to_vec();
+                    searching = false;
                 }
-            }
+                Some((query, found)) if found.is_empty() => {
+                    error(&format!(
+                        "No document name contains '{}'. Showing all again.",
+                        query
+                    ));
+                    listed = files.to_vec();
+                    searching = false;
+                    current_page = 0;
+                }
+                Some((_, found)) => {
+                    listed = found;
+                    searching = true;
+                    current_page = 0;
+                }
+            },
 
             "r" => {
-                active_list = files.to_vec();
-                search_active = false;
+                listed = files.to_vec();
+                searching = false;
                 current_page = 0;
             }
 
-            raw => {
-                // Try to interpret as a selection number
-                if let Ok(num) = raw.parse::<usize>() {
-                    if num >= 1 && num <= active_list.len() {
-                        let chosen = active_list[num - 1];
-                        println!("Picked: {}", bold(chosen.name()));
-                        return Some(chosen);
-                    } else {
-                        error(&format!("Pick a number from 1 to {}.", active_list.len()));
-                    }
-                } else {
-                    error("That's not an option. Type a number, or one of the letters shown.");
+            // Anything else should be the number of a document
+            raw => match raw.parse::<usize>() {
+                Ok(number) if (1..=listed.len()).contains(&number) => {
+                    let chosen = listed[number - 1];
+                    println!("Picked: {}", bold(chosen.name()));
+                    return Some(chosen);
                 }
-            }
+                Ok(_) => error(&format!("Pick a number from 1 to {}.", listed.len())),
+                Err(_) => {
+                    error("That's not an option. Type a number, or one of the letters shown.")
+                }
+            },
         }
     }
+}
+
+/// One page of `listed`: how many there are, then each document with the
+/// number that picks it.
+fn print_page(root: &Path, listed: &[&FileInfo], page: usize, pages: usize, searching: bool) {
+    let shown = if searching {
+        format!("{} matching your search", listed.len())
+    } else {
+        plural(listed.len(), "document", "documents")
+    };
+    let page_info = if pages > 1 {
+        format!(" · page {} of {}", page + 1, pages)
+    } else {
+        String::new()
+    };
+    hint(&format!("\n{}{}", shown, page_info));
+
+    let first = page * PAGE_SIZE;
+    for (i, file) in listed.iter().enumerate().skip(first).take(PAGE_SIZE) {
+        println!(
+            "  {:>3}  {:<34}  {}",
+            i + 1,
+            truncate(file.name(), 34),
+            dim(&truncate(&folder_of(file, root), 30)),
+        );
+    }
+    println!();
+}
+
+/// What can be typed on this page. Moving between pages is only offered
+/// when there is a page to go to.
+fn print_choices(page: usize, pages: usize, searching: bool) {
+    println!("  • Type a number   to pick that document");
+    if page + 1 < pages {
+        println!("  • Type n          for the next page");
+    }
+    if page > 0 {
+        println!("  • Type p          for the previous page");
+    }
+    if searching {
+        println!("  • Type r          to show all documents again");
+    } else {
+        println!("  • Type s          to search by name");
+    }
+    println!("  • Type 0          to cancel");
+}
+
+/// Asks for part of a name. `None` if nothing was typed; otherwise what was
+/// typed, in lowercase, with the documents whose name contains it (maybe none).
+fn ask_search<'a>(files: &[&'a FileInfo]) -> Option<(String, Vec<&'a FileInfo>)> {
+    println!("Type part of the name:");
+    prompt();
+    let query = read_line_from_user().to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    let found = files
+        .iter()
+        .filter(|f| f.name().to_lowercase().contains(&query))
+        .copied()
+        .collect();
+    Some((query, found))
 }

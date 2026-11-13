@@ -4,6 +4,7 @@
 //! while a single big file is being read. It only appears on a real terminal;
 //! when output goes to a file or a pipe nothing is drawn.
 
+use crate::core::Progress;
 use crate::ui::style::dim;
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
@@ -14,9 +15,17 @@ use std::time::Duration;
 const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
 const TICK: Duration = Duration::from_millis(100);
 
-/// Spinner shown until it is dropped. Feed it progress with `update`,
-/// e.g. by passing `&|done, total| spinner.update(done, total)` to a `core` function.
-pub struct Spinner {
+/// Runs `work` with a spinner on screen: `◐ <label> <count> <unit>`. `work`
+/// gets the progress callback that `core` functions take, and each call to
+/// it moves the count. The spinner is gone by the time this returns, so
+/// whatever is printed next starts on a clean line.
+pub fn with_spinner<T>(label: &str, unit: &str, work: impl FnOnce(Progress) -> T) -> T {
+    let spinner = Spinner::start(label, unit);
+    work(&|done, total| spinner.update(done, total))
+}
+
+/// Spinner shown until it is dropped.
+struct Spinner {
     done: Arc<AtomicUsize>,
     total: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
@@ -26,7 +35,7 @@ pub struct Spinner {
 impl Spinner {
     /// Starts showing `◐ <label> <count> <unit>`. With a known total the
     /// count reads "340 of 1555", otherwise just "340".
-    pub fn start(label: &str, unit: &str) -> Spinner {
+    fn start(label: &str, unit: &str) -> Spinner {
         let done = Arc::new(AtomicUsize::new(0));
         let total = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -69,7 +78,7 @@ impl Spinner {
 
     /// Records progress; the next frame shows it. Parallel work may report out
     /// of order, so the count only ever moves forward.
-    pub fn update(&self, done: usize, total: usize) {
+    fn update(&self, done: usize, total: usize) {
         self.done.fetch_max(done, Ordering::Relaxed);
         self.total.store(total, Ordering::Relaxed);
     }

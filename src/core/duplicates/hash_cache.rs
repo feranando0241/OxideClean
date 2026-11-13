@@ -53,6 +53,18 @@ struct Entry {
     full: Option<String>,
 }
 
+impl Entry {
+    /// An entry used today, with no hash yet, for a file in this state.
+    fn new(fingerprint: Fingerprint) -> Entry {
+        Entry {
+            fingerprint,
+            last_used_day: today(),
+            prefix: None,
+            full: None,
+        }
+    }
+}
+
 /// Hash cache shared by the hashing threads.
 pub struct HashCache {
     enabled: bool,
@@ -61,13 +73,17 @@ pub struct HashCache {
 }
 
 impl HashCache {
-    /// A cache that stores nothing: every hash is computed (`--no-cache`).
-    pub fn disabled() -> HashCache {
+    fn new(enabled: bool, entries: HashMap<FileId, Entry>) -> HashCache {
         HashCache {
-            enabled: false,
-            entries: Mutex::new(HashMap::new()),
+            enabled,
+            entries: Mutex::new(entries),
             hits: AtomicUsize::new(0),
         }
+    }
+
+    /// A cache that stores nothing: every hash is computed (`--no-cache`).
+    pub fn disabled() -> HashCache {
+        HashCache::new(false, HashMap::new())
     }
 
     /// Loads the cache from `file`. A missing, unreadable, corrupt or
@@ -77,11 +93,7 @@ impl HashCache {
             .ok()
             .and_then(|text| parse(&text))
             .unwrap_or_default();
-        HashCache {
-            enabled: true,
-            entries: Mutex::new(entries),
-            hits: AtomicUsize::new(0),
-        }
+        HashCache::new(true, entries)
     }
 
     /// Returns the cached hash of `path` if the file is unchanged since it was
@@ -122,6 +134,20 @@ impl HashCache {
         if !self.enabled {
             return Ok(());
         }
+        let out = self.to_text();
+
+        if let Some(dir) = file.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        // Unique temp name so two running instances don't write the same file
+        let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
+        fs::write(&tmp, out)?;
+        fs::rename(&tmp, file)
+    }
+
+    /// The cache as the text `parse` reads back: the header, then one line
+    /// per entry used in the last `MAX_IDLE_DAYS`.
+    fn to_text(&self) -> String {
         let today = today();
         let entries = self.entries.lock().unwrap();
 
@@ -147,15 +173,7 @@ impl HashCache {
                 e.full.as_deref().unwrap_or("-"),
             );
         }
-        drop(entries);
-
-        if let Some(dir) = file.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        // Unique temp name so two running instances don't write the same file
-        let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
-        fs::write(&tmp, out)?;
-        fs::rename(&tmp, file)
+        out
     }
 
     fn lookup(&self, id: FileId, fingerprint: Fingerprint, kind: HashKind) -> Option<String> {
@@ -174,20 +192,10 @@ impl HashCache {
 
     fn store(&self, id: FileId, fingerprint: Fingerprint, kind: HashKind, hash: String) {
         let mut entries = self.entries.lock().unwrap();
-        let entry = entries.entry(id).or_insert(Entry {
-            fingerprint,
-            last_used_day: today(),
-            prefix: None,
-            full: None,
-        });
+        let entry = entries.entry(id).or_insert_with(|| Entry::new(fingerprint));
         // Same inode but the file changed (or the inode was reused): start over
         if entry.fingerprint != fingerprint {
-            *entry = Entry {
-                fingerprint,
-                last_used_day: today(),
-                prefix: None,
-                full: None,
-            };
+            *entry = Entry::new(fingerprint);
         }
         entry.last_used_day = today();
         match kind {
@@ -247,43 +255,49 @@ fn parse(text: &str) -> Option<HashMap<FileId, Entry>> {
 
     let mut entries = HashMap::new();
     for line in lines {
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 10 {
-            return None;
-        }
-        let hash = |s: &str| -> Option<Option<String>> {
-            match s {
-                "-" => Some(None),
-                // A SHA-256 written by us: exactly 64 lowercase hex digits
-                h if h.len() == 64
-                    && h.bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
-                {
-                    Some(Some(h.to_string()))
-                }
-                _ => None,
-            }
-        };
-        let id = FileId {
-            dev: f[0].parse().ok()?,
-            ino: f[1].parse().ok()?,
-        };
-        let fingerprint = Fingerprint {
-            size: f[2].parse().ok()?,
-            mtime: (f[3].parse().ok()?, f[4].parse().ok()?),
-            ctime: (f[5].parse().ok()?, f[6].parse().ok()?),
-        };
-        entries.insert(
-            id,
-            Entry {
-                fingerprint,
-                last_used_day: f[7].parse().ok()?,
-                prefix: hash(f[8])?,
-                full: hash(f[9])?,
-            },
-        );
+        let (id, entry) = parse_line(line)?;
+        entries.insert(id, entry);
     }
     Some(entries)
+}
+
+/// One line of the cache file: ten fields separated by tabs, as `to_text`
+/// writes them.
+fn parse_line(line: &str) -> Option<(FileId, Entry)> {
+    let f: Vec<&str> = line.split('\t').collect();
+    if f.len() != 10 {
+        return None;
+    }
+    let id = FileId {
+        dev: f[0].parse().ok()?,
+        ino: f[1].parse().ok()?,
+    };
+    let fingerprint = Fingerprint {
+        size: f[2].parse().ok()?,
+        mtime: (f[3].parse().ok()?, f[4].parse().ok()?),
+        ctime: (f[5].parse().ok()?, f[6].parse().ok()?),
+    };
+    let entry = Entry {
+        fingerprint,
+        last_used_day: f[7].parse().ok()?,
+        prefix: parse_hash(f[8])?,
+        full: parse_hash(f[9])?,
+    };
+    Some((id, entry))
+}
+
+/// A hash field: `-` for "not computed" (`Some(None)`), or a SHA-256 written
+/// by us, exactly 64 lowercase hex digits. Anything else is malformed.
+fn parse_hash(field: &str) -> Option<Option<String>> {
+    let is_sha256 = field.len() == 64
+        && field
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    match field {
+        "-" => Some(None),
+        hash if is_sha256 => Some(Some(hash.to_string())),
+        _ => None,
+    }
 }
 
 #[cfg(all(test, unix))]

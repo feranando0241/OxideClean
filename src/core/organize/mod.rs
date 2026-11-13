@@ -112,6 +112,20 @@ pub enum OrganizeBy {
     Words,
 }
 
+impl OrganizeBy {
+    /// The way of grouping that the command line and the menu call `name`:
+    /// year, size, type or words.
+    pub fn from_name(name: &str) -> Option<OrganizeBy> {
+        match name {
+            "year" => Some(OrganizeBy::Year),
+            "size" => Some(OrganizeBy::Size),
+            "type" => Some(OrganizeBy::Type),
+            "words" => Some(OrganizeBy::Words),
+            _ => None,
+        }
+    }
+}
+
 /// One file and the place it would move to.
 #[derive(Debug, Clone)]
 pub struct PlannedMove {
@@ -160,44 +174,55 @@ pub struct MoveReport {
 /// The subfolder `file` belongs in, or `None` if it stays where it is (only
 /// with `Words`). `now` decides which dates are in the future.
 pub fn folder_for(file: &FileInfo, by: OrganizeBy, now: SystemTime) -> Option<String> {
-    let folder = match by {
-        OrganizeBy::Year => {
-            return Some(
-                file.modified
-                    .filter(|&t| t <= now)
-                    .and_then(year_of)
-                    .map_or("Unknown year".to_string(), |y| y.to_string()),
-            );
-        }
-        OrganizeBy::Size => match file.size_bytes {
-            s if s < MB => "Under 1 MB",
-            s if s < 100 * MB => "1 MB to 100 MB",
-            s if s < GB => "100 MB to 1 GB",
-            _ => "Over 1 GB",
-        },
-        OrganizeBy::Type => {
-            let ext = file.extension_or("");
-            TYPE_FOLDERS
-                .iter()
-                .find(|(_, exts)| exts.contains(&ext))
-                .map_or("Other", |(folder, _)| folder)
-        }
-        OrganizeBy::Words => {
-            let words = words_of(&file.path.file_stem()?.to_string_lossy());
-            let topic = WORD_FOLDERS
-                .iter()
-                .find(|(_, keys)| keys.iter().any(|k| words.iter().any(|w| w == k)))
-                .map(|(folder, _)| *folder);
-            let ext = file.extension_or("");
-            topic.or_else(|| {
-                EXTENSION_FOLDERS
-                    .iter()
-                    .find(|(_, e)| *e == ext)
-                    .map(|(folder, _)| *folder)
-            })?
-        }
-    };
-    Some(folder.to_string())
+    match by {
+        OrganizeBy::Year => Some(year_folder(file, now)),
+        OrganizeBy::Size => Some(size_folder(file.size_bytes).to_string()),
+        OrganizeBy::Type => Some(type_folder(file.extension_or("")).to_string()),
+        OrganizeBy::Words => word_folder(file).map(String::from),
+    }
+}
+
+/// The year the content last changed, unless that date is missing or later
+/// than `now`.
+fn year_folder(file: &FileInfo, now: SystemTime) -> String {
+    file.modified
+        .filter(|&t| t <= now)
+        .and_then(year_of)
+        .map_or("Unknown year".to_string(), |y| y.to_string())
+}
+
+fn size_folder(size_bytes: u64) -> &'static str {
+    match size_bytes {
+        s if s < MB => "Under 1 MB",
+        s if s < 100 * MB => "1 MB to 100 MB",
+        s if s < GB => "100 MB to 1 GB",
+        _ => "Over 1 GB",
+    }
+}
+
+/// `extension` in lowercase, as `FileInfo` keeps it.
+fn type_folder(extension: &str) -> &'static str {
+    TYPE_FOLDERS
+        .iter()
+        .find(|(_, extensions)| extensions.contains(&extension))
+        .map_or("Other", |(folder, _)| folder)
+}
+
+/// The topic the words of the name point to; without one, the folder of its
+/// extension, if it has one. `None` leaves the file where it is.
+fn word_folder(file: &FileInfo) -> Option<&'static str> {
+    let words = words_of(&file.path.file_stem()?.to_string_lossy());
+    let topic = WORD_FOLDERS
+        .iter()
+        .find(|(_, keys)| keys.iter().any(|k| words.iter().any(|w| w == k)))
+        .map(|(folder, _)| *folder);
+    let extension = file.extension_or("");
+    topic.or_else(|| {
+        EXTENSION_FOLDERS
+            .iter()
+            .find(|(_, e)| *e == extension)
+            .map(|(folder, _)| *folder)
+    })
 }
 
 /// The words of a file name, lowercase and without accents: "Mi_CV-Solución.pdf"
@@ -239,7 +264,7 @@ pub fn plan_organize(
     now: SystemTime,
 ) -> OrganizePlan {
     let mut plan = OrganizePlan::default();
-    // Lowercase: the default macOS disk treats "A.jpg" and "a.jpg" as the same name
+    // The destinations planned so far (see `reason_to_stay`)
     let mut taken: HashSet<String> = HashSet::new();
 
     for file in files.iter().filter(|f| f.path.parent() == Some(root)) {
@@ -254,18 +279,7 @@ pub fn plan_organize(
             continue;
         };
         let to = root.join(folder).join(name);
-        let skip = if IN_PROGRESS_EXTENSIONS.contains(&file.extension_or(""))
-            || recently_changed(file, now)
-        {
-            Some(MoveSkip::InProgress)
-        } else if fs::symlink_metadata(&to).is_ok() {
-            Some(MoveSkip::DestinationExists)
-        } else if !taken.insert(to.to_string_lossy().to_lowercase()) {
-            Some(MoveSkip::SameDestination)
-        } else {
-            None
-        };
-        match skip {
+        match reason_to_stay(file, &to, now, &mut taken) {
             Some(reason) => plan.skipped.push((file.path.clone(), reason)),
             None => plan.moves.push(PlannedMove {
                 file: file.clone(),
@@ -276,6 +290,25 @@ pub fn plan_organize(
     plan.moves.sort_by(|a, b| a.to.cmp(&b.to));
     plan.skipped.sort_by(|a, b| a.0.cmp(&b.0));
     plan
+}
+
+/// Why `file` can't be planned to move to `to`, or `None` if it can; then
+/// `to` joins `taken`, the destinations already planned.
+fn reason_to_stay(
+    file: &FileInfo,
+    to: &Path,
+    now: SystemTime,
+    taken: &mut HashSet<String>,
+) -> Option<MoveSkip> {
+    if IN_PROGRESS_EXTENSIONS.contains(&file.extension_or("")) || recently_changed(file, now) {
+        return Some(MoveSkip::InProgress);
+    }
+    if fs::symlink_metadata(to).is_ok() {
+        return Some(MoveSkip::DestinationExists);
+    }
+    // Lowercase: the default macOS disk treats "A.jpg" and "a.jpg" as the same name
+    let is_free = taken.insert(to.to_string_lossy().to_lowercase());
+    (!is_free).then_some(MoveSkip::SameDestination)
 }
 
 /// Moves every file of `plan`, checking each one first.
@@ -298,10 +331,7 @@ pub fn apply_with(
             let folder = planned.to.parent().expect("destination is inside root");
             fs::create_dir_all(folder)
                 .and_then(|()| mv(from, &planned.to))
-                .map_err(|err| match err.kind() {
-                    io::ErrorKind::AlreadyExists => MoveSkip::DestinationExists,
-                    _ => MoveSkip::CouldNotMove(err.to_string()),
-                })
+                .map_err(refused)
         });
         match outcome {
             Ok(()) => report.moved.push((from.clone(), planned.to.clone())),
@@ -312,17 +342,21 @@ pub fn apply_with(
     report
 }
 
+/// The reason to report when the system refuses a move. A name that got
+/// taken in the meantime has its own: nothing is ever overwritten.
+fn refused(err: io::Error) -> MoveSkip {
+    match err.kind() {
+        io::ErrorKind::AlreadyExists => MoveSkip::DestinationExists,
+        _ => MoveSkip::CouldNotMove(err.to_string()),
+    }
+}
+
 /// Checks from disk that the file is still the one that was planned.
 fn recheck(planned: &PlannedMove, now: SystemTime) -> Result<(), MoveSkip> {
-    let metadata =
-        fs::symlink_metadata(&planned.file.path).map_err(|_| MoveSkip::ChangedSinceScan)?;
-    let current = FileInfo::from_metadata(planned.file.path.clone(), &metadata);
-    if !metadata.is_file()
-        || current.size_bytes != planned.file.size_bytes
-        || current.modified != planned.file.modified
-    {
-        return Err(MoveSkip::ChangedSinceScan);
-    }
+    let current = planned
+        .file
+        .unchanged_on_disk()
+        .ok_or(MoveSkip::ChangedSinceScan)?;
     if recently_changed(&current, now) {
         return Err(MoveSkip::InProgress);
     }

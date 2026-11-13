@@ -665,3 +665,17 @@ fn screenshots_lists_only_old_ones_and_moves_nothing() {
     assert!(trash.status.success(), "stderr: {}", stderr(&trash));
     assert!(kept);
 }
+
+#[test]
+fn interactive_similarity_rejects_nan_as_a_percentage() {
+    let dir = fixture("interactive_nan");
+    // 7: similar documents, 1: first document, 4: type a percentage
+    let input = format!("{}\n7\n1\n4\nnan\n0\nq\n", path_str(&dir));
+    let out = run(&[], &input);
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout(&out);
+    assert!(text.contains("Not a number, using 30%"), "{}", text);
+    assert!(!text.contains("NaN"), "{}", text);
+}

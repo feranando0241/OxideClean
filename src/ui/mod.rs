@@ -1,11 +1,11 @@
 //! Terminal user interface: everything that is printed or typed.
 //!
 //! - `style`   colors, titles, prompts and text helpers
-//! - `report`  result screens
-//! - `input`   reading lines, paths and group selections
-//! - `duplicates` choosing which duplicate groups to move and what to keep
-//! - `artifacts` the build folders screen
-//! - `screenshots` the screenshots screen
+//! - `report`  result screens, and the report shared by moves to the Trash
+//! - `input`   reading lines, paths, yes/no answers and selections
+//! - `duplicates` the identical files screens: list, choosing, results
+//! - `artifacts` the build folders screens: list, choosing, results
+//! - `screenshots` the screenshots screens: list, choosing, results
 //! - `organize` the plan and report for organizing files into folders
 //! - `menu`    start screen and action menu
 //! - `browser` folder browser

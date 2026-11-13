@@ -1,12 +1,80 @@
-//! The interactive choices after the duplicate groups are shown: move all of
-//! them, only some groups, or first pick a folder whose copies should be kept.
+//! The screens for identical files: the groups, the choices after they are
+//! shown (move all of them, only some groups, or first pick a folder whose
+//! copies should be kept), and what happened.
 
-use crate::core::duplicates::{DuplicateGroup, keep_copies_inside};
-use crate::core::paths::folder_in_scan;
-use crate::ui::input::{parse_selection, read_line_from_user, resolve_user_path};
-use crate::ui::report::print_exact_duplicates;
-use crate::ui::style::{bold, error, hint, plural, prompt};
+use crate::core::duplicates::trash::{SkipReason, TrashReport};
+use crate::core::duplicates::{
+    DuplicateGroup, extra_copies_in, keep_copies_inside, wasted_bytes_in,
+};
+use crate::ui::input::{confirm, is_one_of, pick, read_line_from_user, resolve_user_folder};
+use crate::ui::style::{
+    bold, dim, error, format_size, green, header, hint, plural, prompt, red, relative, rule, yellow,
+};
 use std::path::Path;
+
+/// Displays exact duplicates verified by hash and the recoverable space.
+pub fn print_exact_duplicates(root: &Path, groups: &[DuplicateGroup]) {
+    if groups.is_empty() {
+        println!("\nNo exact duplicate files found.");
+        return;
+    }
+
+    header("Identical files");
+    hint("These files have exactly the same content. In each group the oldest");
+    hint("copy is kept (or every copy inside the folder you pick); the extra");
+    hint("copies can be moved to the Trash.");
+
+    for (i, group) in groups.iter().enumerate() {
+        print_group(root, i + 1, group);
+    }
+
+    println!();
+    rule();
+    println!(
+        "{} in {} · {} can be freed\n",
+        plural(extra_copies_in(groups), "extra copy", "extra copies"),
+        plural(groups.len(), "group", "groups"),
+        yellow(&bold(&format_size(wasted_bytes_in(groups))))
+    );
+}
+
+/// One group: what it is, then every path, marked as kept or extra.
+fn print_group(root: &Path, number: usize, group: &DuplicateGroup) {
+    println!(
+        "\n{}  {}",
+        bold(&format!("Group {}", number)),
+        dim(&format!(
+            "{} · {} each · {} can be freed",
+            group.original().name(),
+            format_size(group.file_size),
+            format_size(group.wasted_bytes())
+        ))
+    );
+    // Copies in age order; hardlinks of one copy share its label
+    for (index, copy) in group.copies.iter().enumerate() {
+        let label = if group.is_kept(index) {
+            green("keep ")
+        } else {
+            red("extra")
+        };
+        for path in &copy.paths {
+            println!("  {}  {}", label, relative(&path.path, root));
+        }
+    }
+}
+
+/// The single y/N question for `--trash` without `--yes`.
+pub fn confirm_trash_all(groups: &[DuplicateGroup]) -> bool {
+    let copies = extra_copies_in(groups);
+    confirm(
+        &format!(
+            "Move the {} to the Trash? You can restore {} from there later.",
+            plural(copies, "extra copy", "extra copies"),
+            if copies == 1 { "it" } else { "them" }
+        ),
+        "  Type y to move them, or press Enter to leave everything as it is.",
+    )
+}
 
 /// Asks what to do with `groups` until the user decides. Returns the groups
 /// to move to the Trash, or `None` to leave everything as it is. Choosing a
@@ -28,10 +96,7 @@ pub fn choose_groups_to_trash(
         if answer.is_empty() {
             return None;
         }
-        if ["y", "yes", "all"]
-            .iter()
-            .any(|c| answer.eq_ignore_ascii_case(c))
-        {
+        if is_one_of(&answer, &["y", "yes", "all"]) {
             return Some(groups.to_vec());
         }
         if let Some(folder) = answer.strip_prefix("k ").map(str::trim) {
@@ -39,14 +104,11 @@ pub fn choose_groups_to_trash(
             continue;
         }
 
-        match parse_selection(&answer, groups.len()) {
-            Ok(indices) => {
-                let selected: Vec<DuplicateGroup> =
-                    indices.iter().map(|&i| groups[i].clone()).collect();
-                let copies: usize = selected.iter().map(|g| g.extra_copies()).sum();
+        match pick(&answer, groups) {
+            Ok(selected) => {
                 hint(&format!(
                     "Moving {} from {}.",
-                    plural(copies, "extra copy", "extra copies"),
+                    plural(extra_copies_in(&selected), "extra copy", "extra copies"),
                     plural(selected.len(), "group", "groups")
                 ));
                 return Some(selected);
@@ -62,7 +124,7 @@ pub fn choose_groups_to_trash(
 /// Switches every group that has copies inside `folder` to keep all of them,
 /// then shows the groups again so the user sees what changed.
 fn keep_copies_in(root: &Path, groups: &mut [DuplicateGroup], folder: &str) {
-    let path = folder_in_scan(root, &resolve_user_path(folder));
+    let path = resolve_user_folder(root, folder);
     if !path.is_dir() {
         error(&format!("'{}' is not a folder here.", folder));
         return;
@@ -76,10 +138,49 @@ fn keep_copies_in(root: &Path, groups: &mut [DuplicateGroup], folder: &str) {
         return;
     }
     print_exact_duplicates(root, groups);
-    hint(&format!(
+    hint(&kept_inside_note(folder, found, groups.len()));
+}
+
+/// The line that says how many groups now keep their copies in `folder`.
+pub fn kept_inside_note(folder: &str, found: usize, groups: usize) -> String {
+    format!(
         "Keeping every copy inside '{}' in {} of {}.",
         folder,
         found,
-        plural(groups.len(), "group", "groups")
-    ));
+        plural(groups, "group", "groups")
+    )
+}
+
+/// Displays what happened when moving duplicates to the Trash.
+pub fn print_trash_report(root: &Path, report: &TrashReport) {
+    println!(
+        "\n{} moved to the Trash · {} freed",
+        bold(&plural(report.moved, "file", "files")),
+        bold(&format_size(report.freed_bytes))
+    );
+    if report.moved > 0 {
+        hint("Changed your mind? You can restore them from the Trash.");
+    }
+
+    if !report.failed.is_empty() {
+        let title = format!(
+            "{} not moved:",
+            plural(report.failed.len(), "file was", "files were")
+        );
+        println!("\n{}", yellow(&bold(&title)));
+        for (path, reason) in &report.failed {
+            let why = match reason {
+                SkipReason::KeptCopyChanged(kept) => format!(
+                    "skipped: the kept copy '{}' is missing or changed since the scan",
+                    relative(kept, root)
+                ),
+                SkipReason::ChangedSinceScan => {
+                    "skipped: missing or changed since the scan".to_string()
+                }
+                SkipReason::CouldNotMove(err) => format!("could not be moved: {}", err),
+            };
+            println!("  {} {}", relative(path, root), dim(&format!("— {}", why)));
+        }
+    }
+    println!();
 }

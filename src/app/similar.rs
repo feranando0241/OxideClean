@@ -5,7 +5,7 @@ use crate::core::models::FileInfo;
 use crate::core::paths::in_scan_form;
 use crate::core::similarity::find_similar_documents;
 use crate::ui::input::resolve_user_path;
-use crate::ui::progress::Spinner;
+use crate::ui::progress::with_spinner;
 use crate::ui::report::print_similarity_results;
 use std::fs;
 use std::path::Path;
@@ -32,12 +32,9 @@ pub fn show_similar_documents(
     files: &[FileInfo],
     threshold: f64,
 ) -> Result<(), AppError> {
-    let matches = {
-        let spinner = Spinner::start("Reading documents", "documents");
-        find_similar_documents(target, files, threshold, &|done, total| {
-            spinner.update(done, total)
-        })?
-    };
+    let matches = with_spinner("Reading documents", "documents", |progress| {
+        find_similar_documents(target, files, threshold, progress)
+    })?;
     print_similarity_results(root, target.name(), &matches, threshold);
     Ok(())
 }

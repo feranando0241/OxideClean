@@ -2,40 +2,44 @@
 //! calls the core logic and shows the result. Anything that must behave the
 //! same in both modes (especially the rules for moving files to the Trash)
 //! lives here, in one place.
+//!
+//! This file holds what every action shares: the error type, the scan, the
+//! command-line dispatch and the rules for moving files. Each action with
+//! more than a screen to show has its own file:
+//! - `duplicates`  identical files and their extra copies
+//! - `artifacts`   build folders
+//! - `screenshots` screenshots left behind
+//! - `organize`    sorting loose files into folders, and undoing it
+//! - `similar`     comparing one document with the others
 
+mod artifacts;
+mod duplicates;
 mod organize;
 mod screenshots;
 mod similar;
 
+pub use artifacts::handle_artifacts;
+pub use duplicates::{DupesMode, handle_duplicates};
 pub use organize::{handle_organize, handle_undo};
-pub use screenshots::{ScreenshotsMode, handle_screenshots};
+pub use screenshots::handle_screenshots;
 pub use similar::show_similar_documents;
 
 use crate::cli::{Action, RunOptions};
-use crate::core::artifact_trash::trash_artifacts;
-use crate::core::artifacts::find_artifacts;
-use crate::core::duplicates::hash_cache::HashCache;
-use crate::core::duplicates::trash::trash_duplicates;
-use crate::core::duplicates::{DuplicateGroup, find_exact_duplicates, keep_copies_inside};
 use crate::core::files::{filter_by_extension, find_same_name_files, get_top_largest};
 use crate::core::models::FileInfo;
 use crate::core::old_files::{days, find_old_files};
-use crate::core::paths::folder_in_scan;
 use crate::core::scanner::scan_directory;
 use crate::core::similarity::SimilarityError;
-use crate::ui::artifacts::{choose_artifacts, print_artifact_trash_report, print_artifacts};
-use crate::ui::duplicates::choose_groups_to_trash;
-use crate::ui::input::{read_line_from_user, resolve_user_path};
-use crate::ui::progress::Spinner;
+use crate::ui::input::{resolve_user_folder, resolve_user_path};
+use crate::ui::progress::with_spinner;
 use crate::ui::report::{
-    print_exact_duplicates, print_filtered_files, print_old_files, print_same_name_results,
-    print_top_largest, print_trash_report,
+    print_filtered_files, print_old_files, print_same_name_results, print_top_largest,
 };
-use crate::ui::style::{hint, plural, prompt};
+use crate::ui::style::{hint, plural};
 use std::fmt;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Everything that can make an action fail. Each variant keeps the details
 /// (and the underlying error, when there is one) instead of a pre-built
@@ -95,6 +99,10 @@ impl From<SimilarityError> for AppError {
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// SCANNING AND DISPATCH
+// ─────────────────────────────────────────────────────────────
+
 /// Resolves a folder given on the command line, expanding `~`.
 pub fn resolve_folder(path: &str) -> Result<PathBuf, AppError> {
     let root = resolve_user_path(path);
@@ -108,15 +116,20 @@ pub fn resolve_folder(path: &str) -> Result<PathBuf, AppError> {
 /// Scans `root` recursively, showing a spinner with the files found so far,
 /// and leaves out anything inside the `--exclude` folders.
 pub fn scan(root: &Path, options: &RunOptions) -> io::Result<Vec<FileInfo>> {
-    let mut files = {
-        let spinner = Spinner::start("Scanning", "files found");
-        scan_directory(root, &|done, total| spinner.update(done, total))?
-    };
+    let mut files = with_spinner("Scanning", "files found", |progress| {
+        scan_directory(root, progress)
+    })?;
+    leave_out_excluded(&mut files, root, &options.exclude);
+    Ok(files)
+}
 
-    // ponytail: excluded folders are still walked and then filtered out; skip
-    // them during the walk if excluding huge folders ever feels slow.
-    for folder in &options.exclude {
-        let path = folder_in_scan(root, &resolve_user_path(folder));
+/// Drops the files inside each `--exclude` folder, saying how many each one
+/// left out. A folder that isn't there is reported and ignored.
+// ponytail: excluded folders are still walked and then filtered out; skip
+// them during the walk if excluding huge folders ever feels slow.
+fn leave_out_excluded(files: &mut Vec<FileInfo>, root: &Path, exclude: &[String]) {
+    for folder in exclude {
+        let path = resolve_user_folder(root, folder);
         if !path.is_dir() {
             hint(&format!(
                 "(--exclude {}: no such folder here, ignored)",
@@ -132,25 +145,6 @@ pub fn scan(root: &Path, options: &RunOptions) -> io::Result<Vec<FileInfo>> {
             folder
         ));
     }
-    Ok(files)
-}
-
-/// Where the hash cache is stored: under `$XDG_CACHE_HOME` if set, otherwise
-/// `~/Library/Caches` on macOS (Apple's place for app caches) and `~/.cache`
-/// elsewhere. `None` if there is no home folder to put it in.
-fn cache_file() -> Option<PathBuf> {
-    let base = match std::env::var_os("XDG_CACHE_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => {
-            let home = PathBuf::from(std::env::var_os("HOME")?);
-            if cfg!(target_os = "macos") {
-                home.join("Library/Caches")
-            } else {
-                home.join(".cache")
-            }
-        }
-    };
-    Some(base.join("oxide_clean").join("hashes.tsv"))
 }
 
 /// Scans `root` and runs one command-line action on it.
@@ -175,11 +169,7 @@ pub fn run_action(root: &Path, action: Action, options: &RunOptions) -> Result<(
             assume_yes,
             keep_in,
         } => {
-            let mode = if trash {
-                DupesMode::TrashAll { assume_yes }
-            } else {
-                DupesMode::ListOnly
-            };
+            let mode = DupesMode::from_flags(trash, assume_yes);
             handle_duplicates(root, &files, options, keep_in.as_deref(), mode)?
         }
         Action::SameName => show_same_name_files(root, &files),
@@ -190,11 +180,7 @@ pub fn run_action(root: &Path, action: Action, options: &RunOptions) -> Result<(
             trash,
             assume_yes,
         } => {
-            let mode = match (trash, assume_yes) {
-                (false, _) => ArtifactsMode::ListOnly,
-                (true, false) => ArtifactsMode::Choose,
-                (true, true) => ArtifactsMode::MoveClearCut,
-            };
+            let mode = TrashMode::from_flags(trash, assume_yes);
             handle_artifacts(root, &files, options, days, all, mode)?
         }
         Action::Similar { file, threshold } => {
@@ -206,17 +192,17 @@ pub fn run_action(root: &Path, action: Action, options: &RunOptions) -> Result<(
             trash,
             assume_yes,
         } => {
-            let mode = match (trash, assume_yes) {
-                (false, _) => ScreenshotsMode::ListOnly,
-                (true, false) => ScreenshotsMode::Choose,
-                (true, true) => ScreenshotsMode::MoveAll,
-            };
+            let mode = TrashMode::from_flags(trash, assume_yes);
             handle_screenshots(root, &files, days, mode)?
         }
         Action::Organize { .. } | Action::Undo { .. } => unreachable!("handled before the scan"),
     }
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────
+// ACTIONS THAT ONLY SHOW
+// ─────────────────────────────────────────────────────────────
 
 /// Prints the files matching an extension, or a notice when there are none.
 pub fn show_files_by_extension(root: &Path, files: &[FileInfo], ext: &str) {
@@ -244,223 +230,43 @@ pub fn show_same_name_files(root: &Path, files: &[FileInfo]) {
 /// must be a valid threshold (`core::old_files::days`); the CLI and the menu
 /// check it first.
 pub fn show_old_files(root: &Path, files: &[FileInfo], n: u64) {
-    let threshold = days(n).expect("the caller checked the number of days");
+    let threshold = threshold_of(n);
     // Read the clock after the scan, so no scanned date can be in the future
     // just because it was written during the scan
     let now = SystemTime::now();
     print_old_files(root, &find_old_files(files, now, threshold), n);
 }
 
-/// What happens after the build folders are shown.
+/// `n` days as a threshold. The CLI and the menu only let valid numbers of
+/// days through (`core::old_files::days`), so this can't fail.
+fn threshold_of(n: u64) -> Duration {
+    days(n).expect("the caller checked the number of days")
+}
+
+// ─────────────────────────────────────────────────────────────
+// THE RULES FOR MOVING FILES
+// ─────────────────────────────────────────────────────────────
+
+/// What happens after a list of things that can go to the Trash is shown
+/// (build folders, screenshots).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArtifactsMode {
-    /// Only list them (`--artifacts`).
+pub enum TrashMode {
+    /// Only list them.
     ListOnly,
     /// Let the user pick which to move (`--trash`, the menu).
     Choose,
-    /// Move the clear-cut ones without asking (`--trash --yes`).
-    MoveClearCut,
+    /// Move, without asking, the ones that may go unattended (`--trash --yes`).
+    Unattended,
 }
 
-/// Shows the build folders of projects untouched for more than `n` days (see
-/// ADR-0005), or of every project with `all`, and acts according to `mode`.
-/// `n` must be a valid threshold, like in `show_old_files`.
-pub fn handle_artifacts(
-    root: &Path,
-    files: &[FileInfo],
-    options: &RunOptions,
-    n: u64,
-    all: bool,
-    mode: ArtifactsMode,
-) -> Result<(), AppError> {
-    let threshold = days(n).expect("the caller checked the number of days");
-    let excluded: Vec<PathBuf> = options
-        .exclude
-        .iter()
-        .map(|folder| folder_in_scan(root, &resolve_user_path(folder)))
-        .collect();
-    let now = SystemTime::now();
-    let found = {
-        let spinner = Spinner::start("Measuring build folders", "folders");
-        find_artifacts(
-            files,
-            root,
-            &excluded,
-            now,
-            threshold,
-            all,
-            &|done, total| spinner.update(done, total),
-        )
-    };
-    print_artifacts(root, &found, n, all, mode == ArtifactsMode::ListOnly);
-
-    let selected = match mode {
-        ArtifactsMode::ListOnly => return Ok(()),
-        ArtifactsMode::MoveClearCut => found
-            .found
-            .iter()
-            .filter(|a| a.moves_unattended())
-            .cloned()
-            .collect(),
-        ArtifactsMode::Choose => {
-            if !found.found.iter().any(|a| a.can_move()) {
-                return Ok(());
-            }
-            require_terminal()?;
-            choose_artifacts(&found).unwrap_or_default()
+impl TrashMode {
+    /// The mode the command-line flags ask for.
+    pub fn from_flags(trash: bool, assume_yes: bool) -> TrashMode {
+        match (trash, assume_yes) {
+            (false, _) => TrashMode::ListOnly,
+            (true, false) => TrashMode::Choose,
+            (true, true) => TrashMode::Unattended,
         }
-    };
-    if selected.is_empty() {
-        println!("Nothing was moved.\n");
-        return Ok(());
-    }
-
-    let report = {
-        let spinner = Spinner::start("Re-checking build folders before moving them", "folders");
-        // A fresh clock: the user may have taken a while to choose
-        trash_artifacts(&selected, SystemTime::now(), threshold, &|done, total| {
-            spinner.update(done, total)
-        })
-    };
-    print_artifact_trash_report(root, &report);
-    if report.skipped.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::NotAllMoved(report.skipped.len()))
-    }
-}
-
-/// What happens after the duplicate groups are shown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DupesMode {
-    /// Only list them (`--dupes`).
-    ListOnly,
-    /// Move every extra copy after a y/N question, or straight away with
-    /// `assume_yes` (`--dupes --trash [--yes]`).
-    TrashAll { assume_yes: bool },
-    /// Let the user pick groups and a folder to keep (the menu).
-    Choose,
-}
-
-/// Finds the duplicate groups, shows them, and then acts according to `mode`.
-///
-/// With `keep_in`, each group keeps every copy inside that folder (if it has
-/// any) instead of the oldest. The folder must exist and hold at least one
-/// copy; otherwise nothing happens and an error is returned, so a typo can't
-/// make `--trash --yes` remove the copies the user meant to keep.
-///
-/// Moving anything needs a terminal to confirm on, unless `assume_yes`.
-/// With `options.use_cache`, hashes of unchanged files are reused from
-/// earlier runs and the cache is updated (a failed save is not an error).
-pub fn handle_duplicates(
-    root: &Path,
-    files: &[FileInfo],
-    options: &RunOptions,
-    keep_in: Option<&str>,
-    mode: DupesMode,
-) -> Result<(), AppError> {
-    // Check the folder before hashing, so a typo fails fast and the same way
-    // whether or not any duplicates turn up
-    let keep_path = match keep_in {
-        Some(folder) => {
-            let path = folder_in_scan(root, &resolve_user_path(folder));
-            if !path.is_dir() {
-                return Err(AppError::NotADirectory(path));
-            }
-            Some(path)
-        }
-        None => None,
-    };
-
-    hint("\nComparing file contents …");
-    let cache_path = if options.use_cache {
-        cache_file()
-    } else {
-        None
-    };
-    let cache = match &cache_path {
-        Some(path) => HashCache::load(path),
-        None => HashCache::disabled(),
-    };
-
-    let mut duplicate_groups = {
-        let spinner = Spinner::start("Comparing file contents", "files");
-        find_exact_duplicates(files, &cache, &|done, total| spinner.update(done, total))
-    };
-
-    if let Some(path) = &cache_path
-        && let Err(err) = cache.save(path)
-    {
-        hint(&format!(
-            "(Couldn't save the hash cache at {}: {})",
-            path.display(),
-            err
-        ));
-    }
-    if cache.hits() > 0 {
-        hint(&format!(
-            "Reused {} saved {} for files that haven't changed.",
-            cache.hits(),
-            if cache.hits() == 1 { "hash" } else { "hashes" }
-        ));
-    }
-
-    if duplicate_groups.is_empty() {
-        println!("No identical copies found. Nothing to clean up here.\n");
-        return Ok(());
-    }
-
-    if let Some((folder, path)) = keep_in.zip(keep_path) {
-        let found = keep_copies_inside(&mut duplicate_groups, &path);
-        if found == 0 {
-            return Err(AppError::NoCopyInside(path));
-        }
-        hint(&format!(
-            "Keeping every copy inside '{}' in {} of {}.",
-            folder,
-            found,
-            plural(duplicate_groups.len(), "group", "groups")
-        ));
-    }
-
-    print_exact_duplicates(root, &duplicate_groups);
-
-    let to_trash = match mode {
-        DupesMode::ListOnly => return Ok(()),
-        DupesMode::TrashAll { assume_yes } => {
-            // Possible when --keep-in holds every copy of every group
-            if duplicate_groups.iter().all(|g| g.extra_copies() == 0) {
-                println!("Every copy is kept, so there's nothing to move.\n");
-                return Ok(());
-            }
-            if !assume_yes && !confirm_trash_all(&duplicate_groups)? {
-                println!("Nothing was moved.\n");
-                return Ok(());
-            }
-            duplicate_groups
-        }
-        DupesMode::Choose => {
-            require_terminal()?;
-            match choose_groups_to_trash(root, &mut duplicate_groups) {
-                Some(selected) => selected,
-                None => {
-                    println!("Nothing was moved.\n");
-                    return Ok(());
-                }
-            }
-        }
-    };
-
-    let report = {
-        let spinner = Spinner::start("Re-checking files before moving them", "files");
-        trash_duplicates(&to_trash, &|done, total| spinner.update(done, total))
-    };
-    print_trash_report(root, &report);
-
-    if report.failed.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::NotAllMoved(report.failed.len()))
     }
 }
 
@@ -474,17 +280,28 @@ fn require_terminal() -> Result<(), AppError> {
     }
 }
 
-/// The single y/N question for `--trash` without `--yes`.
-fn confirm_trash_all(groups: &[DuplicateGroup]) -> Result<bool, AppError> {
+/// Whether to go ahead and move files: yes with `assume_yes`; otherwise
+/// whatever the user answers to `ask`, which needs a terminal.
+fn confirmed(assume_yes: bool, ask: impl FnOnce() -> bool) -> Result<bool, AppError> {
+    if assume_yes {
+        return Ok(true);
+    }
     require_terminal()?;
-    let copies: usize = groups.iter().map(|g| g.extra_copies()).sum();
-    println!(
-        "Move the {} to the Trash? You can restore {} from there later.",
-        plural(copies, "extra copy", "extra copies"),
-        if copies == 1 { "it" } else { "them" }
-    );
-    hint("  Type y to move them, or press Enter to leave everything as it is.");
-    prompt();
-    let answer = read_line_from_user();
-    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+    Ok(ask())
+}
+
+/// How an action that could have moved files ends when it moved none.
+fn nothing_moved() -> Result<(), AppError> {
+    println!("Nothing was moved.\n");
+    Ok(())
+}
+
+/// How an action that moved files ends: with an error if `left` of them had
+/// to stay where they were (the report already said which and why).
+fn all_moved(left: usize) -> Result<(), AppError> {
+    if left == 0 {
+        Ok(())
+    } else {
+        Err(AppError::NotAllMoved(left))
+    }
 }
