@@ -2,10 +2,11 @@
 //! file re-read from disk right before it is touched.
 
 use crate::core::Progress;
-use crate::core::duplicates::DuplicateGroup;
 use crate::core::duplicates::hash_cache::HashCache;
 use crate::core::duplicates::hashing::{hash_in_parallel, hash_threads};
+use crate::core::duplicates::{DuplicateGroup, FileCopy};
 use crate::core::models::FileInfo;
+use crate::core::trash::move_to_trash;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,9 +45,7 @@ pub enum SkipReason {
 ///
 /// `on_progress` gets `(verified, total)` over every file involved.
 pub fn trash_duplicates(groups: &[DuplicateGroup], on_progress: Progress) -> TrashReport {
-    remove_duplicates(groups, on_progress, &|path| {
-        trash::delete(path).map_err(|e| e.to_string())
-    })
+    remove_duplicates(groups, on_progress, &move_to_trash)
 }
 
 /// `trash_duplicates` with the removal step passed in, so tests can run the
@@ -66,17 +65,9 @@ pub fn remove_duplicates(
         // Verify one group at a time (its files in parallel), then act on it
         // right away: verifying everything first would widen the window in
         // which a file could change between its check and its move.
-        let files: Vec<FileInfo> = std::iter::once(group.original())
-            .chain(group.paths_to_remove())
-            .cloned()
-            .collect();
-        let current: HashMap<PathBuf, String> =
-            hash_in_parallel(&files, hash_threads(), &HashCache::disabled(), &|| {
-                on_progress(verified.fetch_add(1, Ordering::Relaxed) + 1, total);
-            })
-            .into_iter()
-            .map(|(file, hash)| (file.path, hash))
-            .collect();
+        let current = current_hashes(group, &|| {
+            on_progress(verified.fetch_add(1, Ordering::Relaxed) + 1, total);
+        });
         let unchanged = |file: &FileInfo| current.get(&file.path) == Some(&group.hash);
 
         if !unchanged(group.original()) {
@@ -88,35 +79,59 @@ pub fn remove_duplicates(
         }
 
         for copy in group.extras() {
-            // A copy's space comes back only once every one of its paths is gone
-            let mut every_path_moved = true;
-            for path in &copy.paths {
-                if !unchanged(path) {
-                    report
-                        .failed
-                        .push((path.path.clone(), SkipReason::ChangedSinceScan));
-                    every_path_moved = false;
-                    continue;
-                }
-                match remove(&path.path) {
-                    Ok(()) => report.moved += 1,
-                    Err(err) => {
-                        report
-                            .failed
-                            .push((path.path.clone(), SkipReason::CouldNotMove(err)));
-                        every_path_moved = false;
-                    }
-                }
-            }
             // ponytail: hardlinks outside the scanned folder aren't seen, so the
             // space may not really come back; compare st_nlink if that matters.
-            if every_path_moved {
+            if remove_copy(copy, &unchanged, remove, &mut report) {
                 report.freed_bytes += group.file_size;
             }
         }
     }
 
     report
+}
+
+/// The hash that every file `group` involves has on disk right now: the kept
+/// copy and each path that would be moved. Never from the cache; a file that
+/// can't be read is left out, so it matches nothing.
+fn current_hashes(
+    group: &DuplicateGroup,
+    on_file_done: &(dyn Fn() + Sync),
+) -> HashMap<PathBuf, String> {
+    let files: Vec<FileInfo> = std::iter::once(group.original())
+        .chain(group.paths_to_remove())
+        .cloned()
+        .collect();
+    hash_in_parallel(&files, hash_threads(), &HashCache::disabled(), on_file_done)
+        .into_iter()
+        .map(|(file, hash)| (file.path, hash))
+        .collect()
+}
+
+/// Moves every path of one extra copy, leaving in place (and reporting) the
+/// ones that changed or that the system refused. True if all of them went:
+/// a copy's space comes back only once every one of its paths is gone.
+fn remove_copy(
+    copy: &FileCopy,
+    unchanged: &dyn Fn(&FileInfo) -> bool,
+    remove: &dyn Fn(&Path) -> Result<(), String>,
+    report: &mut TrashReport,
+) -> bool {
+    let mut every_path_moved = true;
+    for path in &copy.paths {
+        let outcome = if unchanged(path) {
+            remove(&path.path).map_err(SkipReason::CouldNotMove)
+        } else {
+            Err(SkipReason::ChangedSinceScan)
+        };
+        match outcome {
+            Ok(()) => report.moved += 1,
+            Err(reason) => {
+                report.failed.push((path.path.clone(), reason));
+                every_path_moved = false;
+            }
+        }
+    }
+    every_path_moved
 }
 
 #[cfg(test)]

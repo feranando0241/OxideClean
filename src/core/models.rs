@@ -55,6 +55,19 @@ impl FileInfo {
         }
     }
 
+    /// The file as it is on disk right now, or `None` if it is no longer the
+    /// one that was scanned: missing, not a regular file any more (symlinks
+    /// aren't followed), or with a different size or modification date.
+    /// Whatever moves a file checks this right before the move.
+    pub fn unchanged_on_disk(&self) -> Option<FileInfo> {
+        let metadata = fs::symlink_metadata(&self.path).ok()?;
+        let current = FileInfo::from_metadata(self.path.clone(), &metadata);
+        let same = metadata.is_file()
+            && current.size_bytes == self.size_bytes
+            && current.modified == self.modified;
+        same.then_some(current)
+    }
+
     /// Returns the file name (e.g. "document.pdf") as a string slice.
     pub fn name(&self) -> &str {
         self.path

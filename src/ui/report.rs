@@ -1,16 +1,17 @@
 //! Result screens: everything the app prints after a scan or an action.
+//! Features with a screen to choose from have their own file (`duplicates`,
+//! `artifacts`, `screenshots`, `organize`).
 
-use crate::core::duplicates::DuplicateGroup;
-use crate::core::duplicates::trash::{SkipReason, TrashReport};
 use crate::core::files::{
-    SameNameGroup, Usage, group_by_folder, usage_by_extension, usage_by_top_folder,
+    SameNameGroup, Usage, group_by_folder, total_size, usage_by_extension, usage_by_top_folder,
 };
 use crate::core::models::FileInfo;
-use crate::core::old_files::{ARRIVAL_GRACE_DAYS, OldFiles};
+use crate::core::old_files::{ARRIVAL_GRACE_DAYS, ForgottenFile, OldFiles};
 use crate::core::similarity::{RELATED, SimilarityMatch, VERY_SIMILAR};
+use crate::core::trash::TrashOutcome;
 use crate::ui::style::{
-    bar, bold, dim, folder_of, format_age, format_size, green, header, hint, plural, red, relative,
-    rule, truncate, yellow,
+    bar, bold, dim, folder_of, format_age, format_size, green, header, hint, plural, relative,
+    rule, size_cell, truncate, yellow,
 };
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,7 @@ const OLD_SHOWN: usize = 20;
 /// Short overview shown right after a scan: totals, heaviest folders and
 /// heaviest file types. The full tree is available from the action menu.
 pub fn print_summary(root: &Path, files: &[FileInfo]) {
-    let total_size: u64 = files.iter().map(|f| f.size_bytes).sum();
+    let total = total_size(files);
     let folder_count = group_by_folder(files).len();
 
     header(&format!("Scan complete: {}", root.display()));
@@ -36,7 +37,7 @@ pub fn print_summary(root: &Path, files: &[FileInfo]) {
         "  {} in {} · {} in total",
         bold(&plural(files.len(), "file", "files")),
         plural(folder_count, "folder", "folders"),
-        bold(&format_size(total_size))
+        bold(&format_size(total))
     );
 
     let by_type: Vec<(String, Usage)> = usage_by_extension(files)
@@ -47,9 +48,9 @@ pub fn print_summary(root: &Path, files: &[FileInfo]) {
     print_ranking(
         "Where the space goes, by folder",
         &folder_rows(root, files),
-        total_size,
+        total,
     );
-    print_ranking("Where the space goes, by file type", &by_type, total_size);
+    print_ranking("Where the space goes, by file type", &by_type, total);
     println!();
 }
 
@@ -92,7 +93,6 @@ fn print_ranking(title: &str, rows: &[(String, Usage)], total_size: u64) {
 
 /// Displays the scan results organized as a visual tree.
 pub fn print_tree(root: &Path, files: &[FileInfo]) {
-    let total_size: u64 = files.iter().map(|f| f.size_bytes).sum();
     let grouped = group_by_folder(files);
 
     header(&format!(
@@ -101,32 +101,7 @@ pub fn print_tree(root: &Path, files: &[FileInfo]) {
     ));
 
     for (folder, folder_files) in &grouped {
-        let folder_size: u64 = folder_files.iter().map(|f| f.size_bytes).sum();
-
-        println!(
-            "\n{}  {}",
-            bold(&relative(folder, root)),
-            dim(&format!(
-                "{} · {}",
-                plural(folder_files.len(), "file", "files"),
-                format_size(folder_size)
-            ))
-        );
-
-        for (index, file) in folder_files.iter().enumerate() {
-            let branch = if index == folder_files.len() - 1 {
-                "└─"
-            } else {
-                "├─"
-            };
-            println!(
-                "  {} {:<NAME_W$} {:>10}  {}",
-                dim(branch),
-                truncate(file.name(), NAME_W),
-                format_size(file.size_bytes),
-                dim(file.extension_or("no ext"))
-            );
-        }
+        print_tree_folder(root, folder, folder_files);
     }
 
     println!();
@@ -135,8 +110,36 @@ pub fn print_tree(root: &Path, files: &[FileInfo]) {
         "Total: {} in {} · {}\n",
         plural(files.len(), "file", "files"),
         plural(grouped.len(), "folder", "folders"),
-        bold(&format_size(total_size))
+        bold(&format_size(total_size(files)))
     );
+}
+
+/// One folder of the tree: its name and totals, then its files as branches.
+fn print_tree_folder(root: &Path, folder: &Path, files: &[FileInfo]) {
+    println!(
+        "\n{}  {}",
+        bold(&relative(folder, root)),
+        dim(&format!(
+            "{} · {}",
+            plural(files.len(), "file", "files"),
+            format_size(total_size(files))
+        ))
+    );
+
+    for (index, file) in files.iter().enumerate() {
+        let branch = if index == files.len() - 1 {
+            "└─"
+        } else {
+            "├─"
+        };
+        println!(
+            "  {} {:<NAME_W$} {:>10}  {}",
+            dim(branch),
+            truncate(file.name(), NAME_W),
+            format_size(file.size_bytes),
+            dim(file.extension_or("no ext"))
+        );
+    }
 }
 
 /// Displays the top largest files table.
@@ -155,98 +158,15 @@ pub fn print_top_largest(root: &Path, files: &[FileInfo]) {
             "{:<4} {:<NAME_W$} {}  {}",
             i + 1,
             truncate(file.name(), NAME_W),
-            bold(&format!("{:>10}", format_size(file.size_bytes))),
+            size_cell(file.size_bytes),
             dim(&folder_of(file, root))
         );
     }
     println!();
 }
 
-/// Displays the forgotten files (see ADR-0004): the biggest ones, the total,
-/// where that space is, and how many files couldn't be judged or were
-/// protected for having just arrived.
-pub fn print_old_files(root: &Path, found: &OldFiles, days: u64) {
-    header(&format!("Files untouched for more than {} days", days));
-    hint("Neither modified nor read in that time, as far as the file system records it.");
-
-    if found.forgotten.is_empty() {
-        let all_judged = found.just_arrived + found.no_date + found.future_date == 0;
-        if all_judged {
-            println!("\n  None found. Every file here was changed or read recently.");
-        } else {
-            println!("\n  None found.");
-        }
-    } else {
-        println!(
-            "\n{}",
-            dim(&format!(
-                "{:<4} {:<NAME_W$} {:>10}  {:>10}  {}",
-                "#", "NAME", "SIZE", "UNTOUCHED", "FOLDER"
-            ))
-        );
-        for (i, old) in found.forgotten.iter().take(OLD_SHOWN).enumerate() {
-            println!(
-                "{:<4} {:<NAME_W$} {}  {:>10}  {}",
-                i + 1,
-                truncate(old.file.name(), NAME_W),
-                bold(&format!("{:>10}", format_size(old.file.size_bytes))),
-                format_age(old.untouched),
-                dim(&folder_of(&old.file, root))
-            );
-        }
-        if found.forgotten.len() > OLD_SHOWN {
-            println!(
-                "{}",
-                dim(&format!(
-                    "… and {} more (all counted below)",
-                    found.forgotten.len() - OLD_SHOWN
-                ))
-            );
-        }
-
-        println!();
-        rule();
-        println!(
-            "{} untouched · {} in total",
-            plural(found.total.files, "file", "files"),
-            yellow(&bold(&format_size(found.total.bytes)))
-        );
-        let files: Vec<FileInfo> = found.forgotten.iter().map(|f| f.file.clone()).collect();
-        print_ranking(
-            "Where that space is, by folder",
-            &folder_rows(root, &files),
-            found.total.bytes,
-        );
-    }
-
-    // Never drop a file silently: say what was left out and why
-    println!();
-    if found.just_arrived > 0 {
-        hint(&format!(
-            "{} not listed: they arrived on this disk (or their details changed) in the last {} days.",
-            plural(found.just_arrived, "file", "files"),
-            ARRIVAL_GRACE_DAYS
-        ));
-    }
-    if found.no_date > 0 {
-        hint(&format!(
-            "{} not judged: the system reports no modification date.",
-            plural(found.no_date, "file", "files")
-        ));
-    }
-    if found.future_date > 0 {
-        hint(&format!(
-            "{} not judged: a date is in the future (check the clock).",
-            plural(found.future_date, "file", "files")
-        ));
-    }
-    hint("Copies made without keeping dates look new. Nothing was moved or changed.");
-    println!();
-}
-
 /// Displays the list of files filtered by extension.
 pub fn print_filtered_files(root: &Path, ext: &str, files: &[FileInfo]) {
-    let total_size: u64 = files.iter().map(|f| f.size_bytes).sum();
     header(&format!(".{} files: {} found", ext, files.len()));
     println!(
         "{}",
@@ -265,94 +185,8 @@ pub fn print_filtered_files(root: &Path, ext: &str, files: &[FileInfo]) {
     println!(
         "Total space used by .{}: {}\n",
         ext,
-        bold(&format_size(total_size))
+        bold(&format_size(total_size(files)))
     );
-}
-
-/// Displays exact duplicates verified by hash and the recoverable space.
-pub fn print_exact_duplicates(root: &Path, groups: &[DuplicateGroup]) {
-    if groups.is_empty() {
-        println!("\nNo exact duplicate files found.");
-        return;
-    }
-
-    let mut total_wasted: u64 = 0;
-    let mut total_dupe_files: usize = 0;
-
-    header("Identical files");
-    hint("These files have exactly the same content. In each group the oldest");
-    hint("copy is kept (or every copy inside the folder you pick); the extra");
-    hint("copies can be moved to the Trash.");
-
-    for (i, group) in groups.iter().enumerate() {
-        total_wasted += group.wasted_bytes();
-        total_dupe_files += group.extra_copies();
-
-        println!(
-            "\n{}  {}",
-            bold(&format!("Group {}", i + 1)),
-            dim(&format!(
-                "{} · {} each · {} can be freed",
-                group.original().name(),
-                format_size(group.file_size),
-                format_size(group.wasted_bytes())
-            ))
-        );
-        // Copies in age order; hardlinks of one copy share its label
-        for (index, copy) in group.copies.iter().enumerate() {
-            let label = if group.is_kept(index) {
-                green("keep ")
-            } else {
-                red("extra")
-            };
-            for path in &copy.paths {
-                println!("  {}  {}", label, relative(&path.path, root));
-            }
-        }
-    }
-
-    println!();
-    rule();
-    println!(
-        "{} in {} · {} can be freed\n",
-        plural(total_dupe_files, "extra copy", "extra copies"),
-        plural(groups.len(), "group", "groups"),
-        yellow(&bold(&format_size(total_wasted)))
-    );
-}
-
-/// Displays what happened when moving duplicates to the Trash.
-pub fn print_trash_report(root: &Path, report: &TrashReport) {
-    println!(
-        "\n{} moved to the Trash · {} freed",
-        bold(&plural(report.moved, "file", "files")),
-        bold(&format_size(report.freed_bytes))
-    );
-    if report.moved > 0 {
-        hint("Changed your mind? You can restore them from the Trash.");
-    }
-
-    if !report.failed.is_empty() {
-        let title = format!(
-            "{} not moved:",
-            plural(report.failed.len(), "file was", "files were")
-        );
-        println!("\n{}", yellow(&bold(&title)));
-        for (path, reason) in &report.failed {
-            let why = match reason {
-                SkipReason::KeptCopyChanged(kept) => format!(
-                    "skipped: the kept copy '{}' is missing or changed since the scan",
-                    relative(kept, root)
-                ),
-                SkipReason::ChangedSinceScan => {
-                    "skipped: missing or changed since the scan".to_string()
-                }
-                SkipReason::CouldNotMove(err) => format!("could not be moved: {}", err),
-            };
-            println!("  {} {}", relative(path, root), dim(&format!("— {}", why)));
-        }
-    }
-    println!();
 }
 
 /// Displays the interactive list of accessible directories.
@@ -365,56 +199,6 @@ pub fn print_accessible_directories(parent_dir: &Path, dirs: &[PathBuf]) {
             let folder_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("folder");
             println!(" {} {}/", dim(&format!("[{:>2}]", i + 1)), folder_name);
         }
-    }
-    println!();
-}
-
-/// Displays the results of the content similarity comparison.
-pub fn print_similarity_results(
-    root: &Path,
-    target_name: &str,
-    matches: &[SimilarityMatch],
-    threshold: f64,
-) {
-    header(&format!("Documents similar to '{}'", target_name));
-    hint(&format!("Showing matches of {:.0}% or more.", threshold));
-    hint(&format!(
-        "{:.0}%+ very similar · {:.0}-{:.0}% related · below {:.0}% loosely related",
-        VERY_SIMILAR,
-        RELATED,
-        VERY_SIMILAR - 1.0,
-        RELATED
-    ));
-
-    if matches.is_empty() {
-        println!("\nNo document is at least {:.0}% similar.", threshold);
-        hint("Try a lower percentage. Scanned PDFs (images of text) can't be compared.\n");
-        return;
-    }
-
-    println!();
-    for m in matches {
-        let pct = format!("{:>5.1}%", m.similarity_percentage);
-        let pct = match m.similarity_percentage {
-            p if p >= VERY_SIMILAR => green(&bold(&pct)),
-            p if p >= RELATED => yellow(&pct),
-            _ => pct,
-        };
-        println!(
-            "{}  {}  {}",
-            pct,
-            bar(m.similarity_percentage, 100.0, 20),
-            truncate(m.candidate_file.name(), NAME_W)
-        );
-        println!(
-            "        {}",
-            dim(&format!(
-                "{} and {} in common · {}",
-                plural(m.shared_keyword_count, "word", "words"),
-                plural(m.shared_bigram_count, "phrase", "phrases"),
-                folder_of(&m.candidate_file, root)
-            ))
-        );
     }
     println!();
 }
@@ -454,4 +238,194 @@ pub fn print_same_name_results(root: &Path, groups: &[SameNameGroup]) {
         plural(total_files, "file", "files")
     );
     hint("Tip: \"Find identical copies\" (option 5) shows which ones really are the same.\n");
+}
+
+// ─────────────────────────────────────────────────────────────
+// FORGOTTEN FILES
+// ─────────────────────────────────────────────────────────────
+
+/// Displays the forgotten files (see ADR-0004): the biggest ones, the total,
+/// where that space is, and how many files couldn't be judged or were
+/// protected for having just arrived.
+pub fn print_old_files(root: &Path, found: &OldFiles, days: u64) {
+    header(&format!("Files untouched for more than {} days", days));
+    hint("Neither modified nor read in that time, as far as the file system records it.");
+
+    if found.forgotten.is_empty() {
+        let all_judged = found.just_arrived + found.no_date + found.future_date == 0;
+        if all_judged {
+            println!("\n  None found. Every file here was changed or read recently.");
+        } else {
+            println!("\n  None found.");
+        }
+    } else {
+        print_forgotten_table(root, &found.forgotten);
+        print_forgotten_totals(root, found);
+    }
+    print_files_left_out(found);
+}
+
+/// The biggest forgotten files, one per row.
+fn print_forgotten_table(root: &Path, forgotten: &[ForgottenFile]) {
+    println!(
+        "\n{}",
+        dim(&format!(
+            "{:<4} {:<NAME_W$} {:>10}  {:>10}  {}",
+            "#", "NAME", "SIZE", "UNTOUCHED", "FOLDER"
+        ))
+    );
+    for (i, old) in forgotten.iter().take(OLD_SHOWN).enumerate() {
+        println!(
+            "{:<4} {:<NAME_W$} {}  {:>10}  {}",
+            i + 1,
+            truncate(old.file.name(), NAME_W),
+            size_cell(old.file.size_bytes),
+            format_age(old.untouched),
+            dim(&folder_of(&old.file, root))
+        );
+    }
+    if forgotten.len() > OLD_SHOWN {
+        println!(
+            "{}",
+            dim(&format!(
+                "… and {} more (all counted below)",
+                forgotten.len() - OLD_SHOWN
+            ))
+        );
+    }
+}
+
+/// How much every forgotten file adds up to, and which folders hold it.
+fn print_forgotten_totals(root: &Path, found: &OldFiles) {
+    println!();
+    rule();
+    println!(
+        "{} untouched · {} in total",
+        plural(found.total.files, "file", "files"),
+        yellow(&bold(&format_size(found.total.bytes)))
+    );
+    let files: Vec<FileInfo> = found.forgotten.iter().map(|f| f.file.clone()).collect();
+    print_ranking(
+        "Where that space is, by folder",
+        &folder_rows(root, &files),
+        found.total.bytes,
+    );
+}
+
+/// Never drop a file silently: says what was left out of the list and why.
+fn print_files_left_out(found: &OldFiles) {
+    println!();
+    if found.just_arrived > 0 {
+        hint(&format!(
+            "{} not listed: they arrived on this disk (or their details changed) in the last {} days.",
+            plural(found.just_arrived, "file", "files"),
+            ARRIVAL_GRACE_DAYS
+        ));
+    }
+    if found.no_date > 0 {
+        hint(&format!(
+            "{} not judged: the system reports no modification date.",
+            plural(found.no_date, "file", "files")
+        ));
+    }
+    if found.future_date > 0 {
+        hint(&format!(
+            "{} not judged: a date is in the future (check the clock).",
+            plural(found.future_date, "file", "files")
+        ));
+    }
+    hint("Copies made without keeping dates look new. Nothing was moved or changed.");
+    println!();
+}
+
+// ─────────────────────────────────────────────────────────────
+// SIMILAR DOCUMENTS
+// ─────────────────────────────────────────────────────────────
+
+/// Displays the results of the content similarity comparison.
+pub fn print_similarity_results(
+    root: &Path,
+    target_name: &str,
+    matches: &[SimilarityMatch],
+    threshold: f64,
+) {
+    header(&format!("Documents similar to '{}'", target_name));
+    hint(&format!("Showing matches of {:.0}% or more.", threshold));
+    hint(&format!(
+        "{:.0}%+ very similar · {:.0}-{:.0}% related · below {:.0}% loosely related",
+        VERY_SIMILAR,
+        RELATED,
+        VERY_SIMILAR - 1.0,
+        RELATED
+    ));
+
+    if matches.is_empty() {
+        println!("\nNo document is at least {:.0}% similar.", threshold);
+        hint("Try a lower percentage. Scanned PDFs (images of text) can't be compared.\n");
+        return;
+    }
+
+    println!();
+    for m in matches {
+        print_similarity_match(root, m);
+    }
+    println!();
+}
+
+/// One match: its score with a bar, then what it shares and where it is.
+fn print_similarity_match(root: &Path, m: &SimilarityMatch) {
+    let pct = format!("{:>5.1}%", m.similarity_percentage);
+    let pct = match m.similarity_percentage {
+        p if p >= VERY_SIMILAR => green(&bold(&pct)),
+        p if p >= RELATED => yellow(&pct),
+        _ => pct,
+    };
+    println!(
+        "{}  {}  {}",
+        pct,
+        bar(m.similarity_percentage, 100.0, 20),
+        truncate(m.candidate_file.name(), NAME_W)
+    );
+    println!(
+        "        {}",
+        dim(&format!(
+            "{} and {} in common · {}",
+            plural(m.shared_keyword_count, "word", "words"),
+            plural(m.shared_bigram_count, "phrase", "phrases"),
+            folder_of(&m.candidate_file, root)
+        ))
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// MOVES TO THE TRASH
+// ─────────────────────────────────────────────────────────────
+
+/// Displays what happened when moving things to the Trash: how many `one` /
+/// `many` went and the space they hold, then each one left in place with
+/// the reason, as `why` words it.
+pub fn print_trash_outcome<S>(
+    root: &Path,
+    outcome: &TrashOutcome<S>,
+    one: &str,
+    many: &str,
+    why: impl Fn(&S) -> String,
+) {
+    println!(
+        "\n{} moved to the Trash · {} will come back when you empty it",
+        bold(&plural(outcome.moved, one, many)),
+        bold(&format_size(outcome.moved_bytes))
+    );
+    if outcome.moved > 0 {
+        hint("Changed your mind? You can restore them from the Trash.");
+    }
+    for (path, skip) in &outcome.skipped {
+        println!("  {}: {}", relative(path, root), why(skip));
+    }
+    println!();
+}
+
+/// How a move the system refused is worded, with the system's own message.
+pub fn system_refused(message: &str) -> String {
+    format!("the system refused: {}", message)
 }

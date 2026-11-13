@@ -1,6 +1,6 @@
 //! Interactive mode: the start screen and the action menu after a scan.
 
-use crate::app::{self, ArtifactsMode, DupesMode, ScreenshotsMode};
+use crate::app::{self, AppError, DupesMode, TrashMode};
 use crate::cli::RunOptions;
 use crate::core::artifacts::DEFAULT_ARTIFACT_DAYS;
 use crate::core::files::{DEFAULT_TOP, get_top_largest, is_document};
@@ -17,7 +17,11 @@ use crate::ui::report::{
     print_accessible_directories, print_summary, print_top_largest, print_tree,
 };
 use crate::ui::style::{bold, dim, error, header, hint, prompt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+// ─────────────────────────────────────────────────────────────
+// START SCREEN
+// ─────────────────────────────────────────────────────────────
 
 /// The classic interactive mode: pick a folder, then pick actions from a menu.
 pub fn run_interactive() {
@@ -38,30 +42,30 @@ pub fn run_interactive() {
             break;
         }
 
-        if is_one_of(&user_input, &["b", "browse", "dirs", "ls"]) {
-            if let Some(selected_path) = run_directory_browser() {
-                process_target_path(&selected_path, &RunOptions::default());
-            }
-            continue;
+        let folder = if is_one_of(&user_input, &["b", "browse", "dirs", "ls"]) {
+            run_directory_browser()
+        } else {
+            typed_folder(&user_input)
+        };
+        if let Some(folder) = folder {
+            process_target_path(&folder, &RunOptions::default());
         }
+    }
+}
 
-        let target_path = resolve_user_path(&user_input);
-
-        if !target_path.exists() {
-            error(&format!("Folder not found: {}", target_path.display()));
-            hint("  Check the spelling, or type b to browse your folders.");
-            continue;
-        }
-
-        if !target_path.is_dir() {
-            error(&format!(
-                "That's a file, not a folder: {}",
-                target_path.display()
-            ));
-            continue;
-        }
-
-        process_target_path(&target_path, &RunOptions::default());
+/// The folder at the path the user typed, or `None` after saying what is
+/// wrong with it.
+fn typed_folder(input: &str) -> Option<PathBuf> {
+    let path = resolve_user_path(input);
+    if !path.exists() {
+        error(&format!("Folder not found: {}", path.display()));
+        hint("  Check the spelling, or type b to browse your folders.");
+        None
+    } else if !path.is_dir() {
+        error(&format!("That's a file, not a folder: {}", path.display()));
+        None
+    } else {
+        Some(path)
     }
 }
 
@@ -91,6 +95,10 @@ pub fn process_target_path(target_path: &Path, options: &RunOptions) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// ACTION MENU
+// ─────────────────────────────────────────────────────────────
+
 /// Displays and runs the action sub-menu for the currently scanned folder.
 /// Returns true when files may have moved and the folder should be scanned
 /// again, false to choose another folder.
@@ -98,104 +106,43 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
     // Full menu the first time (or on '?'); a compact reminder afterwards
     let mut show_full_menu = true;
     loop {
-        if !show_full_menu {
-            hint("1 all files · 2 biggest · 3 by type · 4 folders · 5 identical copies");
-            hint(
-                "6 same name · 7 similar docs · 8 untouched files · 9 build folders · 10 organize · 11 screenshots · ? full menu · 0 another folder",
-            );
-        } else {
+        if show_full_menu {
             show_full_menu = false;
-            println!("\n{}", bold("What would you like to do?"));
-            hint("\n  Look around");
-            println!("    1  See every file, folder by folder");
-            println!("    2  See the {} biggest files", DEFAULT_TOP);
-            println!("    3  See only one type of file (pdf, jpg, mp4…)");
-            println!("    4  List the folders inside this one");
-            hint("\n  Clean up");
-            println!("    5  Find identical copies of files (and free up space)");
-            println!("    6  Find files with the same name in different places");
-            println!("    8  Find big files nobody has touched in months");
-            println!("    9  Find build folders of projects you stopped working on");
-            println!("    11 Find old screenshots you only took to paste");
-            hint("\n  Organize");
-            println!("    10 Sort the files in this folder into folders (or undo it)");
-            hint("\n  Compare documents");
-            println!("    7  Find documents with similar content");
-            println!();
-            println!("    0  Choose another folder        ?  Show this menu again");
+            print_full_menu();
+        } else {
+            print_short_menu();
         }
         prompt();
 
-        let option = read_line_from_user();
-
-        match option.as_str() {
-            "1" => {
-                print_tree(target_path, files);
-            }
-            "2" => {
-                let top = get_top_largest(files, DEFAULT_TOP);
-                print_top_largest(target_path, &top);
-            }
-            "3" => {
-                println!("\nWhich type of file? (e.g. pdf, jpg, mp4)");
-                prompt();
-                let ext = read_line_from_user();
-                if ext.is_empty() {
-                    hint("No type entered.");
-                } else {
-                    app::show_files_by_extension(target_path, files, &ext);
-                }
-            }
-            "4" => {
-                if let Ok(subdirs) = list_accessible_subdirectories(target_path) {
-                    print_accessible_directories(target_path, &subdirs);
-                } else {
-                    error("Could not list the folders.");
-                }
-            }
-            "5" => {
-                if let Err(err) =
-                    app::handle_duplicates(target_path, files, options, None, DupesMode::Choose)
-                {
-                    error(&err.to_string());
-                    println!();
-                }
-            }
-            "6" => {
-                app::show_same_name_files(target_path, files);
-            }
-            "7" => {
-                run_similarity_steps(target_path, files);
-            }
+        match read_line_from_user().as_str() {
+            "1" => print_tree(target_path, files),
+            "2" => print_top_largest(target_path, &get_top_largest(files, DEFAULT_TOP)),
+            "3" => show_one_file_type(target_path, files),
+            "4" => list_folders(target_path),
+            "5" => show_error(app::handle_duplicates(
+                target_path,
+                files,
+                options,
+                None,
+                DupesMode::Choose,
+            )),
+            "6" => app::show_same_name_files(target_path, files),
+            "7" => run_similarity_steps(target_path, files),
             "8" => {
                 if let Some(n) = ask_days(DEFAULT_OLD_DAYS) {
                     app::show_old_files(target_path, files, n);
                 }
             }
             "9" => {
-                println!(
-                    "\nUntouched for more than how many days? (Enter for {}, or all for every project)",
-                    DEFAULT_ARTIFACT_DAYS
-                );
-                prompt();
-                let answer = read_line_from_user();
-                let scope = if answer.eq_ignore_ascii_case("all") {
-                    Some((DEFAULT_ARTIFACT_DAYS, true))
-                } else {
-                    days_from(&answer, DEFAULT_ARTIFACT_DAYS).map(|n| (n, false))
-                };
-                if let Some((n, all)) = scope
-                    && let Err(err) = app::handle_artifacts(
+                if let Some((n, all)) = ask_artifact_scope() {
+                    show_error(app::handle_artifacts(
                         target_path,
                         files,
                         options,
                         n,
                         all,
-                        ArtifactsMode::Choose,
-                    )
-                {
-                    error(&err.to_string());
-                    println!();
+                        TrashMode::Choose,
+                    ));
                 }
             }
             "10" => {
@@ -204,24 +151,96 @@ fn run_action_menu(target_path: &Path, files: &[FileInfo], options: &RunOptions)
                 }
             }
             "11" => {
-                if let Some(n) = ask_days(DEFAULT_SCREENSHOT_DAYS)
-                    && let Err(err) =
-                        app::handle_screenshots(target_path, files, n, ScreenshotsMode::Choose)
-                {
-                    error(&err.to_string());
-                    println!();
+                if let Some(n) = ask_days(DEFAULT_SCREENSHOT_DAYS) {
+                    show_error(app::handle_screenshots(
+                        target_path,
+                        files,
+                        n,
+                        TrashMode::Choose,
+                    ));
                 }
             }
-            "?" | "help" | "menu" => {
-                show_full_menu = true;
-            }
-            "0" | "exit" | "back" | "q" => {
-                return false;
-            }
-            _ => {
-                error("That's not an option. Type a number from 0 to 11, or ? to see the menu.");
-            }
+            "?" | "help" | "menu" => show_full_menu = true,
+            "0" | "exit" | "back" | "q" => return false,
+            _ => error("That's not an option. Type a number from 0 to 11, or ? to see the menu."),
         }
+    }
+}
+
+fn print_full_menu() {
+    println!("\n{}", bold("What would you like to do?"));
+    hint("\n  Look around");
+    println!("    1  See every file, folder by folder");
+    println!("    2  See the {} biggest files", DEFAULT_TOP);
+    println!("    3  See only one type of file (pdf, jpg, mp4…)");
+    println!("    4  List the folders inside this one");
+    hint("\n  Clean up");
+    println!("    5  Find identical copies of files (and free up space)");
+    println!("    6  Find files with the same name in different places");
+    println!("    8  Find big files nobody has touched in months");
+    println!("    9  Find build folders of projects you stopped working on");
+    println!("    11 Find old screenshots you only took to paste");
+    hint("\n  Organize");
+    println!("    10 Sort the files in this folder into folders (or undo it)");
+    hint("\n  Compare documents");
+    println!("    7  Find documents with similar content");
+    println!();
+    println!("    0  Choose another folder        ?  Show this menu again");
+}
+
+/// The two-line reminder shown once the full menu has been seen.
+fn print_short_menu() {
+    hint("1 all files · 2 biggest · 3 by type · 4 folders · 5 identical copies");
+    hint(
+        "6 same name · 7 similar docs · 8 untouched files · 9 build folders · 10 organize · 11 screenshots · ? full menu · 0 another folder",
+    );
+}
+
+/// Shows why an action failed. The menu goes on either way.
+fn show_error(result: Result<(), AppError>) {
+    if let Err(err) = result {
+        error(&err.to_string());
+        println!();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// THE QUESTIONS BEHIND EACH OPTION
+// ─────────────────────────────────────────────────────────────
+
+/// Option 3: asks for a file type and lists the files of that type.
+fn show_one_file_type(target_path: &Path, files: &[FileInfo]) {
+    println!("\nWhich type of file? (e.g. pdf, jpg, mp4)");
+    prompt();
+    let ext = read_line_from_user();
+    if ext.is_empty() {
+        hint("No type entered.");
+    } else {
+        app::show_files_by_extension(target_path, files, &ext);
+    }
+}
+
+/// Option 4: lists the folders directly inside the scanned one.
+fn list_folders(target_path: &Path) {
+    match list_accessible_subdirectories(target_path) {
+        Ok(subdirs) => print_accessible_directories(target_path, &subdirs),
+        Err(_) => error("Could not list the folders."),
+    }
+}
+
+/// Option 9: asks which projects to look at. Returns the number of days a
+/// project must be untouched for, and whether to list every project (`all`).
+fn ask_artifact_scope() -> Option<(u64, bool)> {
+    println!(
+        "\nUntouched for more than how many days? (Enter for {}, or all for every project)",
+        DEFAULT_ARTIFACT_DAYS
+    );
+    prompt();
+    let answer = read_line_from_user();
+    if answer.eq_ignore_ascii_case("all") {
+        Some((DEFAULT_ARTIFACT_DAYS, true))
+    } else {
+        days_from(&answer, DEFAULT_ARTIFACT_DAYS).map(|n| (n, false))
     }
 }
 
@@ -236,24 +255,15 @@ fn run_organize_steps(target_path: &Path) -> bool {
     let result = match answer.as_str() {
         "" => return false,
         "undo" => app::handle_undo(target_path, false),
-        other => {
-            let by = match other {
-                "year" => OrganizeBy::Year,
-                "size" => OrganizeBy::Size,
-                "type" => OrganizeBy::Type,
-                "words" => OrganizeBy::Words,
-                _ => {
-                    error("Type year, size, type, words or undo.");
-                    return false;
-                }
-            };
-            app::handle_organize(target_path, by, true, false)
-        }
+        other => match OrganizeBy::from_name(other) {
+            Some(by) => app::handle_organize(target_path, by, true, false),
+            None => {
+                error("Type year, size, type, words or undo.");
+                return false;
+            }
+        },
     };
-    if let Err(err) = result {
-        error(&err.to_string());
-        println!();
-    }
+    show_error(result);
     true
 }
 
@@ -298,11 +308,24 @@ fn run_similarity_steps(root: &Path, files: &[FileInfo]) {
     header("Step 1 of 2 · Pick a document");
     hint("It will be compared with every other document in this folder.");
 
-    let selected = match select_file_paginated(root, &documents) {
-        Some(f) => f,
-        None => return,
+    let Some(selected) = select_file_paginated(root, &documents) else {
+        return;
     };
+    let threshold = ask_threshold();
 
+    hint(&format!(
+        "\nComparing '{}' with the other documents …",
+        selected.name()
+    ));
+
+    if let Err(err) = app::show_similar_documents(root, selected, files, threshold) {
+        error(&err.to_string());
+    }
+}
+
+/// Step 2 of the comparison: how similar the matches must be, as a
+/// percentage. Enter takes the default.
+fn ask_threshold() -> f64 {
     /// The "anything related" option: looser than the default.
     const LOOSE_THRESHOLD: f64 = 15.0;
 
@@ -318,29 +341,21 @@ fn run_similarity_steps(root: &Path, files: &[FileInfo]) {
     hint("  Press Enter for the recommended option.");
     prompt();
 
-    let threshold: f64 = match read_line_from_user().as_str() {
+    match read_line_from_user().as_str() {
         "2" => VERY_SIMILAR,
         "3" => LOOSE_THRESHOLD,
         "4" => {
             println!("Minimum percentage (0-100):");
             prompt();
             match read_line_from_user().trim_end_matches('%').parse::<f64>() {
-                Ok(value) => value.clamp(0.0, 100.0),
-                Err(_) => {
+                // "nan" parses as a number, and clamp leaves it as it is
+                Ok(value) if !value.is_nan() => value.clamp(0.0, 100.0),
+                _ => {
                     hint(&format!("Not a number, using {:.0}%.", DEFAULT_THRESHOLD));
                     DEFAULT_THRESHOLD
                 }
             }
         }
         _ => DEFAULT_THRESHOLD,
-    };
-
-    hint(&format!(
-        "\nComparing '{}' with the other documents …",
-        selected.name()
-    ));
-
-    if let Err(err) = app::show_similar_documents(root, selected, files, threshold) {
-        error(&err.to_string());
     }
 }

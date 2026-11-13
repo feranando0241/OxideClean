@@ -6,7 +6,8 @@ use crate::core::artifacts::{
     Artifact, ProjectState, activity_by_folder, candidates_in, measure, project_state,
 };
 use crate::core::scanner::scan_directory;
-use std::path::{Path, PathBuf};
+use crate::core::trash::{TrashOutcome, attempt_each, move_to_trash};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 /// A build folder changed this recently may belong to a build still running.
@@ -31,14 +32,7 @@ pub enum ArtifactSkip {
 
 /// Outcome of moving build folders. Every folder is attempted; one failure
 /// doesn't stop the rest.
-#[derive(Debug, Default)]
-pub struct ArtifactTrashReport {
-    pub moved: usize,
-    /// Space those folders hold. It only comes back when the Trash is emptied.
-    pub moved_bytes: u64,
-    /// Folders left in place, with the reason.
-    pub skipped: Vec<(PathBuf, ArtifactSkip)>,
-}
+pub type ArtifactTrashReport = TrashOutcome<ArtifactSkip>;
 
 /// Moves `selected` to the operating system Trash, checking each one first.
 pub fn trash_artifacts(
@@ -47,9 +41,7 @@ pub fn trash_artifacts(
     threshold: Duration,
     on_progress: Progress,
 ) -> ArtifactTrashReport {
-    remove_artifacts(selected, now, threshold, on_progress, &|path| {
-        trash::delete(path).map_err(|e| e.to_string())
-    })
+    remove_artifacts(selected, now, threshold, on_progress, &move_to_trash)
 }
 
 /// `trash_artifacts` with the removal step passed in, so tests can run the
@@ -61,24 +53,16 @@ pub fn remove_artifacts(
     on_progress: Progress,
     remove: &dyn Fn(&Path) -> Result<(), String>,
 ) -> ArtifactTrashReport {
-    let mut report = ArtifactTrashReport::default();
-    on_progress(0, selected.len());
-    for (done, artifact) in selected.iter().enumerate() {
-        let outcome = recheck(artifact, now, threshold).and_then(|bytes| {
-            remove(&artifact.path)
-                .map(|()| bytes)
-                .map_err(ArtifactSkip::CouldNotMove)
-        });
-        match outcome {
-            Ok(bytes) => {
-                report.moved += 1;
-                report.moved_bytes += bytes;
-            }
-            Err(skip) => report.skipped.push((artifact.path.clone(), skip)),
-        }
-        on_progress(done + 1, selected.len());
-    }
-    report
+    attempt_each(
+        selected,
+        |artifact| artifact.path.as_path(),
+        on_progress,
+        |artifact| {
+            let bytes = recheck(artifact, now, threshold)?;
+            remove(&artifact.path).map_err(ArtifactSkip::CouldNotMove)?;
+            Ok(bytes)
+        },
+    )
 }
 
 /// Checks from disk that `artifact` can still be moved, and returns its size.
@@ -86,30 +70,12 @@ fn recheck(artifact: &Artifact, now: SystemTime, threshold: Duration) -> Result<
     if !artifact.can_move() {
         return Err(ArtifactSkip::NotMovable);
     }
-    let still_valid = candidates_in(&artifact.project)
-        .into_iter()
-        .any(|candidate| {
-            candidate.path == artifact.path
-                && candidate.kind == artifact.kind
-                && candidate.verified
-                && candidate.confidence == artifact.confidence
-        });
-    if !still_valid {
+    if !still_a_build_folder(artifact) {
         return Err(ArtifactSkip::NoLongerABuildFolder);
     }
-
-    // A fresh scan of the whole project: unlike the list, it can't miss a
-    // folder left out with --exclude. Active projects were chosen knowingly.
+    // Active projects were chosen knowingly
     if artifact.state == ProjectState::Forgotten {
-        let files = scan_directory(&artifact.project, &|_, _| {})
-            .map_err(|_| ArtifactSkip::NoLongerABuildFolder)?;
-        let folders = activity_by_folder(&files, &artifact.project, now, threshold);
-        let state = folders
-            .get(artifact.project.as_path())
-            .map(|activity| project_state(&artifact.project, activity, now, threshold));
-        if state != Some(ProjectState::Forgotten) {
-            return Err(ArtifactSkip::ProjectInUse);
-        }
+        check_still_forgotten(artifact, now, threshold)?;
     }
 
     let measured = measure(&artifact.path);
@@ -121,6 +87,39 @@ fn recheck(artifact: &Artifact, now: SystemTime, threshold: Duration) -> Result<
         return Err(ArtifactSkip::RecentlyChanged);
     }
     Ok(measured.size.bytes)
+}
+
+/// True if the closed list of ADR-0005 still finds this very folder in its
+/// project, rated as it was when listed.
+fn still_a_build_folder(artifact: &Artifact) -> bool {
+    candidates_in(&artifact.project)
+        .into_iter()
+        .any(|candidate| {
+            candidate.path == artifact.path
+                && candidate.kind == artifact.kind
+                && candidate.verified
+                && candidate.confidence == artifact.confidence
+        })
+}
+
+/// Judges the project again from a fresh scan of all of it: unlike the list,
+/// it can't miss a folder left out with --exclude.
+fn check_still_forgotten(
+    artifact: &Artifact,
+    now: SystemTime,
+    threshold: Duration,
+) -> Result<(), ArtifactSkip> {
+    let files = scan_directory(&artifact.project, &|_, _| {})
+        .map_err(|_| ArtifactSkip::NoLongerABuildFolder)?;
+    let folders = activity_by_folder(&files, &artifact.project, now, threshold);
+    let state = folders
+        .get(artifact.project.as_path())
+        .map(|activity| project_state(&artifact.project, activity, now, threshold));
+    if state == Some(ProjectState::Forgotten) {
+        Ok(())
+    } else {
+        Err(ArtifactSkip::ProjectInUse)
+    }
 }
 
 #[cfg(test)]

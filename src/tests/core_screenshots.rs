@@ -5,7 +5,8 @@
 use super::*;
 use crate::core::scanner::scan_directory;
 use crate::core::test_support::{fake_trash, no_progress, temp_dir, write};
-use std::fs::File;
+use std::fs::{self, File};
+use std::path::PathBuf;
 
 const DAY: Duration = Duration::from_secs(86_400);
 

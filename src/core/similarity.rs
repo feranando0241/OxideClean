@@ -24,7 +24,6 @@ use crate::core::models::FileInfo;
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
-use std::path::Path;
 
 /// Minimum similarity shown when the user doesn't choose one.
 pub const DEFAULT_THRESHOLD: f64 = 30.0;
@@ -78,24 +77,18 @@ impl std::error::Error for SimilarityError {}
 /// - **PDF**: uses the `pdf-extract` crate to parse internal content.
 /// - **Any other text format** (txt, md, rs, json, etc.): direct read.
 ///
-/// Returns `None` if the file cannot be read or is empty.
-pub fn extract_text_from_file(path: &Path) -> Option<String> {
-    let extension = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|s| s.to_lowercase())
-        .unwrap_or_default();
-
-    if extension == "pdf" {
+/// Returns `None` if the file cannot be read.
+pub fn extract_text_from_file(file: &FileInfo) -> Option<String> {
+    if file.extension_or("") == "pdf" {
         // pdf-extract panics on some malformed PDFs: catch it and treat the file
         // as unreadable. The panic hook is silenced so no backtrace hits the screen.
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let result = std::panic::catch_unwind(|| pdf_extract::extract_text(path));
+        let result = std::panic::catch_unwind(|| pdf_extract::extract_text(&file.path));
         std::panic::set_hook(previous_hook);
         result.ok()?.ok()
     } else {
-        fs::read_to_string(path).ok()
+        fs::read_to_string(&file.path).ok()
     }
 }
 
@@ -130,10 +123,9 @@ const STOPWORDS: &[&str] = &[
 
 /// Converts text into a list of clean, meaningful words:
 ///
-/// 1. Splits on spaces and punctuation.
+/// 1. Splits on anything that isn't a letter or a digit (spaces, punctuation).
 /// 2. Converts everything to lowercase.
-/// 3. Removes non-alphanumeric characters.
-/// 4. Discards single-letter words and common stopwords.
+/// 3. Discards very short words (one or two plain letters) and common stopwords.
 ///
 /// Performance note: the stopwords HashSet is built on every call.
 /// If comparing thousands of files in the future, consider moving it to a
@@ -142,12 +134,7 @@ pub fn tokenize_words(text: &str) -> Vec<String> {
     let stopwords: HashSet<&str> = STOPWORDS.iter().copied().collect();
 
     text.split(|c: char| !c.is_alphanumeric())
-        .map(|word| {
-            word.chars()
-                .filter(|c| c.is_alphanumeric())
-                .collect::<String>()
-                .to_lowercase()
-        })
+        .map(str::to_lowercase)
         .filter(|w| w.len() > 2 && !stopwords.contains(w.as_str()))
         .collect()
 }
@@ -173,6 +160,28 @@ pub fn create_shingles(words: &[String], n: usize) -> HashSet<String> {
         shingles.insert(window.join(" "));
     }
     shingles
+}
+
+/// A document reduced to what the comparison looks at.
+struct Document {
+    /// Its unique meaningful words.
+    words: HashSet<String>,
+    /// Its pairs of consecutive words.
+    bigrams: HashSet<String>,
+}
+
+impl Document {
+    /// Reads `file` and breaks its text into words and bigrams. `None` if no
+    /// text could be extracted (unreadable, binary, a scanned PDF) or it is
+    /// blank. A text with no meaningful words still gives a document.
+    fn read(file: &FileInfo) -> Option<Document> {
+        let text = extract_text_from_file(file).filter(|text| !text.trim().is_empty())?;
+        let words = tokenize_words(&text);
+        Some(Document {
+            bigrams: create_shingles(&words, 2),
+            words: words.into_iter().collect(),
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -220,20 +229,15 @@ pub fn calculate_jaccard_similarity(
 /// Vocabulary-only similarity can be misleading: two documents may share
 /// keywords without being truly similar. Adding bigrams requires words to
 /// appear together, which indicates genuinely shared structure and content.
-fn calculate_composite_score(
-    words_a: &HashSet<String>,
-    words_b: &HashSet<String>,
-    bigrams_a: &HashSet<String>,
-    bigrams_b: &HashSet<String>,
-) -> (f64, usize, usize) {
-    let (vocab_sim, shared_words) = calculate_jaccard_similarity(words_a, words_b);
-    let (bigram_sim, shared_bigrams) = calculate_jaccard_similarity(bigrams_a, bigrams_b);
+fn calculate_composite_score(a: &Document, b: &Document) -> (f64, usize, usize) {
+    let (vocab_sim, shared_words) = calculate_jaccard_similarity(&a.words, &b.words);
+    let (bigram_sim, shared_bigrams) = calculate_jaccard_similarity(&a.bigrams, &b.bigrams);
 
     // Length penalty: if one document is much longer than the other,
     // slightly reduce the score. Computed as the ratio of the shorter
     // to the longer document (result between 0.0 and 1.0).
-    let len_a = words_a.len() as f64;
-    let len_b = words_b.len() as f64;
+    let len_a = a.words.len() as f64;
+    let len_b = b.words.len() as f64;
     let length_ratio = if len_a == 0.0 || len_b == 0.0 {
         0.0
     } else {
@@ -274,17 +278,8 @@ pub fn find_similar_documents(
     min_threshold_percentage: f64,
     on_progress: Progress,
 ) -> Result<Vec<SimilarityMatch>, SimilarityError> {
-    // Extract and tokenize the base file's text
-    let target_text = match extract_text_from_file(&target_file.path) {
-        Some(txt) if !txt.trim().is_empty() => txt,
-        _ => return Err(SimilarityError::NoText),
-    };
-
-    let target_words_vec = tokenize_words(&target_text);
-    let target_word_set: HashSet<String> = target_words_vec.iter().cloned().collect();
-    let target_bigrams = create_shingles(&target_words_vec, 2);
-
-    if target_word_set.is_empty() {
+    let target = Document::read(target_file).ok_or(SimilarityError::NoText)?;
+    if target.words.is_empty() {
         return Err(SimilarityError::NoWords);
     }
 
@@ -299,30 +294,19 @@ pub fn find_similar_documents(
     for (read, candidate) in others.iter().enumerate() {
         on_progress(read, others.len());
 
-        if let Some(cand_text) = extract_text_from_file(&candidate.path) {
-            if cand_text.trim().is_empty() {
-                continue;
-            }
+        let Some(document) = Document::read(candidate) else {
+            continue;
+        };
+        let (similarity, shared_words, shared_bigrams) =
+            calculate_composite_score(&target, &document);
 
-            let cand_words_vec = tokenize_words(&cand_text);
-            let cand_word_set: HashSet<String> = cand_words_vec.iter().cloned().collect();
-            let cand_bigrams = create_shingles(&cand_words_vec, 2);
-
-            let (similarity, shared_words, shared_bigrams) = calculate_composite_score(
-                &target_word_set,
-                &cand_word_set,
-                &target_bigrams,
-                &cand_bigrams,
-            );
-
-            if similarity >= min_threshold_percentage {
-                matches.push(SimilarityMatch {
-                    candidate_file: (*candidate).clone(),
-                    similarity_percentage: similarity,
-                    shared_keyword_count: shared_words,
-                    shared_bigram_count: shared_bigrams,
-                });
-            }
+        if similarity >= min_threshold_percentage {
+            matches.push(SimilarityMatch {
+                candidate_file: (*candidate).clone(),
+                similarity_percentage: similarity,
+                shared_keyword_count: shared_words,
+                shared_bigram_count: shared_bigrams,
+            });
         }
     }
     on_progress(others.len(), others.len());

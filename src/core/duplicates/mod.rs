@@ -149,6 +149,16 @@ pub fn keep_copies_inside(groups: &mut [DuplicateGroup], folder: &Path) -> usize
         .count()
 }
 
+/// How many distinct files would be removed across `groups`.
+pub fn extra_copies_in(groups: &[DuplicateGroup]) -> usize {
+    groups.iter().map(|g| g.extra_copies()).sum()
+}
+
+/// Space freed if every extra copy in `groups` is removed.
+pub fn wasted_bytes_in(groups: &[DuplicateGroup]) -> u64 {
+    groups.iter().map(|g| g.wasted_bytes()).sum()
+}
+
 /// Finds real duplicates using a three-step approach:
 /// 1. Group by file size in bytes (fast, zero-cost pre-filter).
 /// 2. Within each size group, compare the first 4 KB of each file.
@@ -165,60 +175,24 @@ pub fn find_exact_duplicates(
     cache: &HashCache,
     on_progress: Progress,
 ) -> Vec<DuplicateGroup> {
-    // Step 1: Group by size
-    let mut by_size: HashMap<u64, Vec<FileInfo>> = HashMap::new();
-    for file in files {
-        if file.size_bytes > 0 {
-            by_size
-                .entry(file.size_bytes)
-                .or_default()
-                .push(file.clone());
-        }
-    }
-
-    let candidate_groups: Vec<Vec<FileInfo>> = by_size
-        .into_values()
-        .filter(|list| list.len() > 1)
-        .collect();
-
-    let total: usize = candidate_groups.iter().map(Vec::len).sum();
+    // Step 1: group by size
+    let size_groups = same_size_groups(files);
+    let total: usize = size_groups.iter().map(Vec::len).sum();
     let mut checked = 0;
     on_progress(checked, total);
 
     // Files whose size and prefix both match another file's: only these are read in full
     let mut needs_full_hash: Vec<FileInfo> = Vec::new();
     // Extra paths (hardlinks) to a file that is already being checked
-    let mut other_links: HashMap<FileId, Vec<FileInfo>> = HashMap::new();
+    let mut other_links: HardLinks = HashMap::new();
 
-    for candidates in candidate_groups {
+    // Step 2: cheap prefix filter, so most files are never read in full
+    for candidates in size_groups {
         let group_len = candidates.len();
-        let mut by_prefix: HashMap<String, Vec<FileInfo>> = HashMap::new();
-        let mut seen_identities = HashSet::new();
-
-        // Step 2: cheap prefix filter, so most files are never read in full
-        for file in candidates {
-            // Hardlinks are one file with several paths: hash it once, and
-            // remember the other paths so they can be removed together.
-            if let Some(identity) = FileId::of(&file.path)
-                && !seen_identities.insert(identity)
-            {
-                other_links.entry(identity).or_default().push(file);
-                continue;
-            }
-            if let Ok(prefix) = cache.get_or_compute(&file.path, HashKind::Prefix, prefix_hash) {
-                by_prefix.entry(prefix).or_default().push(file);
-            }
-        }
-
-        let before = needs_full_hash.len();
-        needs_full_hash.extend(
-            by_prefix
-                .into_values()
-                .filter(|list| list.len() > 1)
-                .flatten(),
-        );
+        let survivors = same_prefix_files(candidates, cache, &mut other_links);
         // Everything else in this size group was ruled out by the steps above
-        checked += group_len - (needs_full_hash.len() - before);
+        checked += group_len - survivors.len();
+        needs_full_hash.extend(survivors);
         on_progress(checked, total);
     }
 
@@ -228,7 +202,69 @@ pub fn find_exact_duplicates(
         on_progress(checked.fetch_add(1, Ordering::Relaxed) + 1, total);
     });
 
-    // Identical content implies identical size, so the hash alone is the group key
+    let mut duplicate_groups = groups_by_hash(hashed, &mut other_links);
+    // Sort from most to least wasted space; ties by path so the order is stable
+    duplicate_groups.sort_by_cached_key(|g| (Reverse(g.wasted_bytes()), g.original().path.clone()));
+    duplicate_groups
+}
+
+/// The other paths (hardlinks) found for a file, by the file's identity.
+type HardLinks = HashMap<FileId, Vec<FileInfo>>;
+
+/// Step 1: the files grouped by size, without empty files and without the
+/// sizes no other file has. Only what is left can have a copy.
+fn same_size_groups(files: &[FileInfo]) -> Vec<Vec<FileInfo>> {
+    let mut by_size: HashMap<u64, Vec<FileInfo>> = HashMap::new();
+    for file in files {
+        if file.size_bytes > 0 {
+            by_size
+                .entry(file.size_bytes)
+                .or_default()
+                .push(file.clone());
+        }
+    }
+    by_size
+        .into_values()
+        .filter(|list| list.len() > 1)
+        .collect()
+}
+
+/// Step 2: the files of one size group whose first 4 KB match another's.
+/// Hardlinks are one file with several paths: it is hashed once, and its
+/// other paths go to `other_links` so they can be removed together.
+fn same_prefix_files(
+    candidates: Vec<FileInfo>,
+    cache: &HashCache,
+    other_links: &mut HardLinks,
+) -> Vec<FileInfo> {
+    let mut by_prefix: HashMap<String, Vec<FileInfo>> = HashMap::new();
+    let mut seen_identities = HashSet::new();
+
+    for file in candidates {
+        if let Some(identity) = FileId::of(&file.path)
+            && !seen_identities.insert(identity)
+        {
+            other_links.entry(identity).or_default().push(file);
+            continue;
+        }
+        if let Ok(prefix) = cache.get_or_compute(&file.path, HashKind::Prefix, prefix_hash) {
+            by_prefix.entry(prefix).or_default().push(file);
+        }
+    }
+    by_prefix
+        .into_values()
+        .filter(|list| list.len() > 1)
+        .flatten()
+        .collect()
+}
+
+/// The groups of two or more fully hashed files with the same content, each
+/// oldest first. Identical content implies identical size, so the hash alone
+/// is the group key.
+fn groups_by_hash(
+    hashed: Vec<(FileInfo, String)>,
+    other_links: &mut HardLinks,
+) -> Vec<DuplicateGroup> {
     let mut by_hash: HashMap<String, Vec<FileInfo>> = HashMap::new();
     for (file, hash) in hashed {
         by_hash.entry(hash).or_default().push(file);
@@ -261,10 +297,6 @@ pub fn find_exact_duplicates(
             duplicate_groups.push(DuplicateGroup::new(hash, file_size, copies));
         }
     }
-
-    // Sort from most to least wasted space; ties by path so the order is stable
-    duplicate_groups.sort_by_cached_key(|g| (Reverse(g.wasted_bytes()), g.original().path.clone()));
-
     duplicate_groups
 }
 

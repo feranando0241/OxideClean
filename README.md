@@ -303,8 +303,8 @@ OxideClean automatically skips folders and files that generate noise:
 src/
 ├── main.rs            — Entry point: parse arguments, pick a mode
 ├── cli.rs             — Command-line argument parsing
-├── app.rs             — Actions shared by the CLI and the menus (incl. Trash rules)
-├── app/               — Actions with their own file: organize.rs, screenshots.rs, similar.rs
+├── app.rs             — What every action shares: errors, the scan, the dispatch and the rules for moving files
+├── app/               — Actions with their own file: duplicates.rs, artifacts.rs, screenshots.rs, organize.rs, similar.rs
 ├── core/              — Logic only: never prints, never reads input
 │   ├── models.rs      — FileInfo (size, dates) and FileId (identity of a file's data on disk)
 │   ├── paths.rs       — Matching folders typed by the user against scanned paths
@@ -314,6 +314,7 @@ src/
 │   ├── artifacts.rs   — Finding build folders in projects (ADR-0005)
 │   ├── artifact_trash.rs — Moving them to the Trash, re-verified from disk
 │   ├── screenshots.rs — Screenshots left behind after pasting (ADR-0008)
+│   ├── trash.rs       — What every move to the Trash shares: one attempt per item, and a report of what stayed and why
 │   ├── organize/      — Sorting loose files into folders (ADR-0007)
 │   │   ├── mod.rs        — Planning and moving, never overwriting
 │   │   └── log.rs        — The move log and undoing from it
@@ -325,12 +326,12 @@ src/
 │   └── similarity.rs  — Document similarity engine (Jaccard + bigrams)
 ├── ui/                — Everything printed or typed
 │   ├── style.rs       — Colors, titles, prompts, text helpers
-│   ├── report.rs      — Result screens
-│   ├── duplicates.rs  — Choosing which duplicate groups to move and what to keep
+│   ├── report.rs      — Result screens, and the report shared by moves to the Trash
+│   ├── duplicates.rs  — The identical files screens: list, choosing, results
 │   ├── artifacts.rs   — The build folders screens: list, choosing, results
 │   ├── organize.rs    — The organize plan, questions and results
 │   ├── screenshots.rs — The screenshots screens: list, choosing, results
-│   ├── input.rs       — Reading lines, paths and group selections
+│   ├── input.rs       — Reading lines, paths, yes/no answers and selections
 │   ├── menu.rs        — Start screen and action menu
 │   ├── browser.rs     — Folder browser
 │   ├── picker.rs      — Paginated document picker
@@ -386,8 +387,8 @@ This project started on 2026-09-24 as one 583-line `main.rs` with four tests. Th
 
 | | First commit (`f142952`) | Now |
 |---|---|---|
-| Rust code | 1,550 lines in 6 files | ~10,100 lines in 54 files |
-| Tests | 4 | 137, including property and end-to-end tests |
+| Rust code | 1,550 lines in 6 files | ~10,500 lines in 57 files |
+| Tests | 4 | 139, including property and end-to-end tests |
 | Recorded decisions | none | 7 ADRs in `docs/adr/` |
 | Moving files to the Trash | the first file found was kept, the first error stopped everything, nothing was checked again | listed first, confirmed, re-checked on disk right before acting, every skip explained |
 

@@ -2,10 +2,11 @@
 //! move to the Trash, and what happened.
 
 use crate::core::screenshots::{Detected, Screenshot, ScreenshotSkip, ScreenshotTrashReport};
-use crate::ui::input::{parse_selection, read_line_from_user};
+use crate::ui::input::{is_yes, pick, read_line_from_user};
+use crate::ui::report::{print_trash_outcome, system_refused};
 use crate::ui::style::{
     bold, dim, error, format_age, format_size, header, hint, plural, prompt, relative, rule,
-    truncate, yellow,
+    size_cell, truncate, yellow,
 };
 use std::path::Path;
 
@@ -35,7 +36,7 @@ pub fn print_screenshots(root: &Path, found: &[Screenshot], days: u64, listing_o
             "{:<4} {:<PATH_W$} {}  {:>9}{}",
             i + 1,
             truncate(&relative(&shot.file.path, root), PATH_W),
-            bold(&format!("{:>10}", format_size(shot.file.size_bytes))),
+            size_cell(shot.file.size_bytes),
             format_age(shot.age),
             if shot.detected == Detected::Name {
                 dim(" (name)")
@@ -79,11 +80,11 @@ pub fn choose_screenshots(found: &[Screenshot]) -> Option<Vec<Screenshot>> {
         if answer.is_empty() {
             return None;
         }
-        if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+        if is_yes(&answer) {
             return Some(found.to_vec());
         }
-        match parse_selection(&answer, found.len()) {
-            Ok(indices) => return Some(indices.iter().map(|&i| found[i].clone()).collect()),
+        match pick(&answer, found) {
+            Ok(selected) => return Some(selected),
             Err(message) => error(&format!("{} Or press Enter to leave them.", message)),
         }
     }
@@ -91,20 +92,14 @@ pub fn choose_screenshots(found: &[Screenshot]) -> Option<Vec<Screenshot>> {
 
 /// Displays what happened when moving screenshots to the Trash.
 pub fn print_screenshot_trash_report(root: &Path, report: &ScreenshotTrashReport) {
-    println!(
-        "\n{} moved to the Trash · {} will come back when you empty it",
-        bold(&plural(report.moved, "screenshot", "screenshots")),
-        bold(&format_size(report.moved_bytes))
-    );
-    if report.moved > 0 {
-        hint("Changed your mind? You can restore them from the Trash.");
-    }
-    for (path, skip) in &report.skipped {
-        let reason = match skip {
+    print_trash_outcome(
+        root,
+        report,
+        "screenshot",
+        "screenshots",
+        |skip| match skip {
             ScreenshotSkip::ChangedSinceScan => "it changed since the list was made".to_string(),
-            ScreenshotSkip::CouldNotMove(message) => format!("the system refused: {}", message),
-        };
-        println!("  {}: {}", relative(path, root), reason);
-    }
-    println!();
+            ScreenshotSkip::CouldNotMove(message) => system_refused(message),
+        },
+    );
 }

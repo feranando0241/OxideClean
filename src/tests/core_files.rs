@@ -86,3 +86,26 @@ fn test_usage_by_folder_and_type() {
         ]
     );
 }
+
+#[test]
+fn test_same_name_groups_with_equal_counts_come_in_name_order() {
+    let files = vec![
+        file("x/c.txt", 1),
+        file("y/c.txt", 1),
+        file("x/a.txt", 1),
+        file("y/a.txt", 1),
+        file("x/b.txt", 1),
+        file("y/b.txt", 1),
+        file("x/z.txt", 1),
+        file("y/z.txt", 1),
+        file("w/z.txt", 1),
+    ];
+    // A HashMap orders differently on each call, so once is not enough
+    for _ in 0..20 {
+        let names: Vec<String> = find_same_name_files(&files)
+            .into_iter()
+            .map(|g| g.shared_name)
+            .collect();
+        assert_eq!(names, vec!["z.txt", "a.txt", "b.txt", "c.txt"]);
+    }
+}

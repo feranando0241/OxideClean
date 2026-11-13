@@ -6,6 +6,7 @@ use super::*;
 use crate::core::artifacts::{ArtifactKind, Artifacts, Confidence, find_artifacts};
 use crate::core::test_support::{fake_trash, no_progress, temp_dir, write};
 use std::fs::{self, File};
+use std::path::PathBuf;
 
 const DAY: Duration = Duration::from_secs(86_400);
 const THRESHOLD: Duration = Duration::from_secs(90 * 86_400);
